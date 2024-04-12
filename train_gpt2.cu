@@ -9,6 +9,7 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
+#include <cuda.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
@@ -16,6 +17,7 @@ GPT-2 Transformer Neural Net trained in raw CUDA
 
 // ----------------------------------------------------------------------------
 // CUDA utils
+#define ENABLE_ACTIVATION_COMPRESSION
 
 // error checking
 void cudaCheck(cudaError_t error, const char *file, int line) {
@@ -463,6 +465,65 @@ void crossentropy_forward(float* losses,
 }
 
 // ----------------------------------------------------------------------------
+// CUDA memory allocation (required for compressible memory support)
+
+CUmemAllocationProp prepareCompressible(size_t *size, bool *UseCompressibleMemory)
+{
+    int compressionAvailable;
+    cuDeviceGetAttribute(&compressionAvailable, CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED, 0);
+    *UseCompressibleMemory = *UseCompressibleMemory && compressionAvailable;
+
+    CUmemAllocationProp prop = {};
+    memset(&prop, 0, sizeof(CUmemAllocationProp));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = 0; // force device 0 for now
+    prop.allocFlags.compressionType = *UseCompressibleMemory ? CU_MEM_ALLOCATION_COMP_GENERIC : 0;
+
+    size_t granularity = 0;
+    assert(!cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    *size = ((*size - 1) / granularity + 1) * granularity;
+
+    return prop;
+}
+
+void allocateCompressible(void **adr, size_t size, bool UseCompressibleMemory)
+{
+    cudaCheck(cudaSetDevice(0)); // required to avoid initialisation issues
+
+    CUdeviceptr dptr;
+    CUmemAllocationProp prop = prepareCompressible(&size, &UseCompressibleMemory);
+    assert(!cuMemAddressReserve(&dptr, size, 0, 0, 0));
+    CUmemGenericAllocationHandle allocationHandle;
+    assert(!cuMemCreate(&allocationHandle, size, &prop, 0));
+
+    // Check if cuMemCreate was able to allocate compressible memory.
+    if (UseCompressibleMemory) {
+        CUmemAllocationProp allocationProp = {};
+        assert(!cuMemGetAllocationPropertiesFromHandle(&allocationProp, allocationHandle));
+        assert(allocationProp.allocFlags.compressionType == CU_MEM_ALLOCATION_COMP_GENERIC);
+    }
+    assert(!cuMemMap(dptr, size, 0, allocationHandle, 0));
+    assert(!cuMemRelease(allocationHandle));
+
+    CUmemAccessDesc accessDescriptor;
+    accessDescriptor.location.id = prop.location.id;
+    accessDescriptor.location.type = prop.location.type;
+    accessDescriptor.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    assert(!cuMemSetAccess(dptr, size, &accessDescriptor, 1));
+
+    *adr = (void *)dptr;
+}
+
+void freeCompressible(void *ptr, size_t size, bool UseCompressibleMemory)
+{
+    if (ptr == NULL)
+        return;
+    CUmemAllocationProp prop = prepareCompressible(&size, &UseCompressibleMemory);
+    assert(!cuMemUnmap((CUdeviceptr)ptr, size) && !cuMemAddressFree((CUdeviceptr)ptr, size));
+}
+
+// ----------------------------------------------------------------------------
 // GPT-2 model definition
 
 // the parameters of the model
@@ -553,7 +614,13 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
         num_activations += act_sizes[i];
     }
     float* acts_memory;
+
+#if defined(ENABLE_ACTIVATION_COMPRESSION)
+    allocateCompressible((void**)&acts_memory, num_activations * sizeof(float), true);
+#else
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
+#endif
+
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
@@ -840,10 +907,19 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->grads_memory));
     cudaCheck(cudaFree(model->m_memory));
     cudaCheck(cudaFree(model->v_memory));
-    cudaCheck(cudaFree(model->acts_memory));
     cudaCheck(cudaFree(model->grads_acts_memory));
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
+
+#if defined(ENABLE_ACTIVATION_COMPRESSION)
+    size_t num_activations = 0;
+    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        num_activations += model->act_sizes[i];
+    }
+    freeCompressible((void*)model->acts_memory, num_activations * sizeof(float), true);
+#else
+    cudaCheck(cudaFree(model->acts_memory));
+#endif
 }
 
 #ifndef TESTING
