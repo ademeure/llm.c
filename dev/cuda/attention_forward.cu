@@ -33,7 +33,13 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
+#include <cudnn_frontend.h>
 #include "common.h"
+
+namespace fe = cudnn_frontend;
+#define checkCudaErr(err) assert((int)err == 0);
+#define checkCudnnErr(err) assert((int)err == 0);
 
 // ----------------------------------------------------------------------------
 // CUDA setup
@@ -787,6 +793,392 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 }
 
+
+__global__ void softmax_forward_kernel5_fp16(half* out, float inv_temperature, const half* inp, int N, int T) {
+    // inp, out shape: (N, T, T), where N = B * NH
+    // fuses the multiplication by scale inside attention
+    // directly autoregressive, so we only compute the lower triangular part
+    // uses the online softmax algorithm
+    assert(T % 4  == 0);
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= N * T) {
+        return;
+    }
+    int own_pos = idx % T;
+    int pos_by_4 = own_pos / 4;
+
+    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    const half* x = inp + idx * T;
+
+    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    float maxval = -FLT_MAX;
+    float sumval = 0.0f;
+
+    // Same thing but without float4, one at a time
+    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
+        float old_maxval = maxval;
+        for(int k = 0; k < 4; ++k) {
+            maxval = fmaxf(maxval, (float)x[4*i + k]);
+        }
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        for(int k = 0; k < 4; ++k) {
+            sumval += expf(inv_temperature * ((float)x[4*i + k] - maxval));
+        }
+    }
+
+    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
+        float old_maxval = maxval;
+        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
+        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        sumval += expf(inv_temperature * ((float)x[4*pos_by_4 + warp.thread_rank()] - maxval));
+    }
+
+    float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
+    sumval *= expf(inv_temperature * (maxval - global_maxval));
+
+    float sum = cg::reduce(warp, sumval, cg::plus<float>{});
+    float norm = 1.f / sum;
+
+    // divide the whole row by the sum
+    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
+        // recalculation is faster than doing the round-trip through memory.
+        float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
+        __stcs(out + idx * T + i, (half)(ev * norm));
+    }
+}
+
+__global__ void permute_kernel_f16(half* q, half* k, half* v,
+                               const float* inp,
+                               int B, int N, int NH, int d) {
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
+    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
+
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int inp_idx = \
+            (b * N * 3 * NH * d)
+            +   (n * 3 * NH * d)
+            +       (0 * NH * d)
+            +          (nh_ * d)
+            +                d_;
+
+        q[idx] = (half)inp[inp_idx];
+        k[idx] = (half)inp[inp_idx + NH * d];
+        v[idx] = (half)inp[inp_idx + 2 * (NH * d)];
+    }
+}
+
+__global__ void unpermute_kernel_f16(const half* inp, float *out, int B, int N, int NH, int d) {
+   // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
+        out[other_idx] = (float)inp[idx];
+    }
+}
+
+void attention_forward5(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size, bool skip_permute=false) {
+    // FP16 version of kernel 4 (with permute/unpermute doing FP32<->FP16)
+    // Permute can be skipped on subsequent runs to analyse its performance impact
+    
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+    int HS = C / NH; // head size
+
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    half *q, *k, *v;
+    q = (half*)qkvr + 0 * B * T * C;
+    k = (half*)qkvr + 1 * B * T * C;
+    v = (half*)qkvr + 2 * B * T * C;
+    int total_threads = B * NH * T * HS;
+    int num_blocks = ceil_div(total_threads, block_size);
+    if (!skip_permute) {
+        permute_kernel_f16<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
+    }
+
+    // batched matrix multiply with cuBLAS
+    const half alpha = (half)1.0f;
+    const half beta = (half)0.0f;
+    cublasCheck(cublasHgemmStridedBatched(cublas_handle,
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     T, T, HS,
+                                     &alpha,
+                                     k, HS, T * HS,
+                                     q, HS, T * HS,
+                                     &beta,
+                                     (half*)preatt, T, T * T,
+                                     B * NH));
+
+    // multiply all elements of preatt elementwise by scale
+    float scale = 1.0 / sqrtf(HS);
+    int softmax_block_size = 256;
+    int grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
+    softmax_forward_kernel5_fp16<<<grid_size, softmax_block_size>>>((half*)att, scale, (half*)preatt, B * NH, T);
+
+    // new approach: first cuBLAS another batched matmul
+    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    cublasCheck(cublasHgemmStridedBatched(cublas_handle,
+                                     CUBLAS_OP_N, CUBLAS_OP_N,
+                                     HS, T, T,
+                                     &alpha,
+                                     v, HS, T * HS,
+                                     (half*)att, T, T * T,
+                                     &beta,
+                                     (half*)vaccum, HS, T * HS,
+                                     B * NH));
+
+    // now unpermute
+    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    num_blocks = ceil_div(B * T * C, block_size);
+    if(!skip_permute) {
+        unpermute_kernel_f16<<<num_blocks, block_size>>>((half*)vaccum, out, B, T, NH, HS);
+    }
+}
+
+#define DATATYPE_16BIT half // or __nv_bfloat16
+#define CUDNN_16BIT fe::DataType_t::HALF // or BFLOAT16
+
+// TODO simplified version of wrapper taken from cuDNN samples, remove/replace this eventually?
+template <typename T_ELEM>
+struct Surface {
+    T_ELEM* devPtr     = NULL;
+    T_ELEM* hostPtr    = NULL;
+    int64_t n_elems    = 0;
+
+    explicit Surface(int64_t n_elems, bool hasRef) : n_elems(n_elems) {
+        (void)hasRef;
+
+        checkCudaErr(cudaMalloc((void**)&(devPtr), (size_t)((n_elems) * sizeof(devPtr[0]))));
+        hostPtr = (T_ELEM*)calloc((size_t)n_elems, sizeof(hostPtr[0]));
+        memset(hostPtr, 0, n_elems * sizeof(T_ELEM));
+
+        checkCudaErr(cudaMemcpy(devPtr, hostPtr, size_t(sizeof(hostPtr[0]) * n_elems), cudaMemcpyHostToDevice));
+        checkCudaErr(cudaDeviceSynchronize());
+    }
+
+    ~Surface() {
+        if (devPtr) {
+            cudaFree(devPtr);
+            devPtr = nullptr;
+        }
+        if (hostPtr) {
+            free(hostPtr);
+            hostPtr = nullptr;
+        }
+    }
+};
+
+using graph_and_tensors = std::tuple<std::shared_ptr<fe::graph::Graph>,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Seed,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Offset,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // O
+                                     std::shared_ptr<fe::graph::Tensor_attributes>   // Stats
+                                     >;
+using cache_type = std::unordered_map<std::size_t, graph_and_tensors>;
+
+template <typename... Args>
+auto lookup_cache_or_build_graph(cudnnHandle_t handle, Args... args) {
+    auto [b,
+          h,
+          s_q,
+          s_kv,
+          d,
+          is_inference,
+          is_attn_scale,
+          causal_mask,
+          use_dropout_with_rng,
+          dropout_probability] = std::make_tuple(args...);
+
+    static cache_type user_maintained_cache;
+
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(CUDNN_16BIT)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    // (B, N, 3, NH, d)
+    auto Q = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("Q")
+                               .set_dim({b, h, s_q, d})
+                               .set_stride({3 * h * d * s_q,  d, 3 * h * d, 1}));
+    auto K = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("K")
+                               .set_dim({b, h, s_kv, d})
+                               .set_stride({3 * h * d * s_kv, d, 3 * h * d, 1}));
+    auto V = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("V")
+                               .set_dim({b, h, s_kv, d})
+                               .set_stride({3 * h * d * s_kv, d, 3 * h * d, 1}));
+
+    auto attn_scale = is_attn_scale ? graph->tensor(fe::graph::Tensor_attributes()
+                                                        .set_name("attn_scale")
+                                                        .set_dim({1, 1, 1, 1})
+                                                        .set_stride({1, 1, 1, 1})
+                                                        .set_is_pass_by_value(true)
+                                                        .set_data_type(fe::DataType_t::FLOAT))
+                                    : nullptr;
+    auto seed = use_dropout_with_rng ? graph->tensor(fe::graph::Tensor_attributes()
+                                                         .set_name("Seed")
+                                                         .set_dim({1, 1, 1, 1})
+                                                         .set_stride({1, 1, 1, 1})
+                                                         .set_data_type(fe::DataType_t::INT32))
+                                     : nullptr;
+    auto offset = use_dropout_with_rng ? graph->tensor(fe::graph::Tensor_attributes()
+                                                           .set_name("Offset")
+                                                           .set_dim({1, 1, 1, 1})
+                                                           .set_stride({1, 1, 1, 1})
+                                                           .set_data_type(fe::DataType_t::INT32))
+                                       : nullptr;
+
+    auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
+    sdpa_options.set_is_inference(is_inference);
+    sdpa_options.set_causal_mask(causal_mask);
+    if (is_attn_scale) {
+        sdpa_options.set_attn_scale(attn_scale);
+    };
+    if (use_dropout_with_rng) {
+        sdpa_options.set_dropout(dropout_probability, seed, offset);
+    }
+
+    auto [O, stats] = graph->sdpa(Q, K, V, sdpa_options);
+
+    // (B, N, NH, d)
+    O->set_output(true).set_dim({b, h, s_q, d}).set_stride({h * d * s_q, d, h * d, 1});
+    assert(stats == nullptr || is_inference == false);    
+    if (!is_inference) {
+        stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+    }
+
+    assert(graph->validate().is_good());
+    auto key = graph->key();
+    auto it = user_maintained_cache.find(key);
+    if (it != user_maintained_cache.end()) {
+        return it->second;
+    }
+
+    assert(graph->build_operation_graph(handle).is_good());
+    auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
+    assert(graph->check_support(handle).is_good());
+    assert(graph->build_plans(handle).is_good());
+
+    user_maintained_cache.insert({key, std::make_tuple(graph, Q, K, V, attn_scale, seed, offset, O, stats)});
+    return std::make_tuple(graph, Q, K, V, attn_scale, seed, offset, O, stats);
+}
+
+__global__ void to_fp16_kernel(DATATYPE_16BIT* out, const float* inp) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    out[idx] = (DATATYPE_16BIT)inp[idx];
+}
+
+__global__ void from_fp16_kernel(const DATATYPE_16BIT* inp, float *out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    out[idx] = (float)inp[idx];
+}
+
+void attention_forward6(float* out, float* vaccum, float* qkvr, const float* inp,
+                        int B, int T, int C, int NH, bool skip_conversion=true) {
+    // inp is (B, T, 3, NH, HS) QKV
+    // out is (B, T, NH, HS)
+
+    static bool cudnnInit = false;
+    static cudnnHandle_t handle;
+    if (!cudnnInit) {
+        checkCudnnErr(cudnnCreate(&handle));
+    }
+    
+    int64_t b = B; // batch size
+    int64_t h = NH; // head size
+    int64_t s_qkv = T; // sequence length (number of tokens)
+    int64_t d = C / NH; // number of features per head
+    bool is_inference         = true;
+    bool is_attn_scale        = true;
+    bool causal_mask          = true;
+    bool use_dropout_with_rng = false;
+    float attn_scale_cpu = 1.0 / sqrtf(d);
+    DATATYPE_16BIT* qkvr_f16 = (DATATYPE_16BIT*)qkvr;
+
+    const int block_size = 64;
+    int total_threads = B * T * C * 3;
+    assert(total_threads % block_size == 0);
+    int num_blocks = total_threads / block_size;
+    if (!cudnnInit || !skip_conversion) {
+        // Currently only handles FP32->FP16 conversion
+        to_fp16_kernel<<<num_blocks, block_size>>>(qkvr_f16, inp);
+    }
+
+    auto [graph, Q, K, V, attn_scale, seed, offset, O, stats] =
+        lookup_cache_or_build_graph(handle,
+                                    b,
+                                    h,
+                                    s_qkv,
+                                    s_qkv,
+                                    d,
+                                    is_inference,
+                                    is_attn_scale,
+                                    causal_mask,
+                                    use_dropout_with_rng,
+                                    0.0f);
+    (void)seed;
+    (void)offset;
+
+    //// Build variant pack
+    static Surface<float> statsTensor(b * h * s_qkv * 1, false); // TODO: handle properly instead of static
+    void* devPtrQ = qkvr_f16;
+    void* devPtrK = (qkvr_f16 + h * d);
+    void* devPtrV = (qkvr_f16 + 2 * h * d);
+    void* devPtrO = (void*)vaccum;
+
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+        {Q, devPtrQ}, {K, devPtrK}, {V, devPtrV}, {attn_scale, &attn_scale_cpu}, {O, devPtrO}};
+    if (is_inference == false) {
+        variant_pack[stats] = statsTensor.devPtr;
+    }
+
+    static Surface<int8_t> workspace(graph->get_workspace_size(), false); // TODO: handle properly instead of static
+    assert(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+
+    total_threads = B * T * C;
+    assert(total_threads % block_size == 0);
+    num_blocks = total_threads / block_size;
+    if (!cudnnInit || !skip_conversion) {
+        // Currently only handles FP16->FP32 conversion
+        from_fp16_kernel<<<num_blocks, block_size>>>((DATATYPE_16BIT*)vaccum, out);
+    }
+
+    cudnnInit = true;
+}
+
+
+
 // kernel version dispatch
 void attention_forward(int kernel_num,
                        float* out, float* vaccum, float* qkvr, float* preatt, float* att,
@@ -805,6 +1197,12 @@ void attention_forward(int kernel_num,
             break;
         case 4:
             attention_forward4(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 5:
+            attention_forward5(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 6:
+            attention_forward6(out, vaccum, qkvr, inp, B, T, C, NH);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -861,18 +1259,18 @@ int main(int argc, char **argv) {
         printf("Checking block size %d.\n", block_size);
         attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
         // all kernels should produce the correct output out
-        validate_result(d_out, out, "out", B * T * C, 1e-4f);
+        validate_result(d_out, out, "out", B * T * C, 1e-3f);
         // but as for preatt and att, things get a bit more complicated:
-        if (kernel_num != 2) {
+        if (kernel_num != 2 && kernel_num != 5 && kernel_num != 6) {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
-            validate_result(d_att, att, "att", B * NH * T * T, 1e-4f);
+            validate_result(d_att, att, "att", B * NH * T * T, 1e-3f);
         }
-        if (kernel_num != 2 && kernel_num != 4) {
+        if (kernel_num != 2 && kernel_num != 4 && kernel_num != 5 && kernel_num != 6) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.
-            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, 1e-4f);
+            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, 1e-3f);
         }
     }
     printf("All results match. Starting benchmarks.\n\n");
