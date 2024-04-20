@@ -2,7 +2,7 @@
 Kernels for attention forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math attention_forward.cu -o attention_forward -lcublas
+nvcc -std=c++17 -O3 --use_fast_math -I$CUDNN_PATH/cudnn-frontend/include -lcublas -lcudnn attention_forward.cu -o attention_forward
 
 version 1 is naive port from CPU code to kernel, parallelize over batch, time, heads only
 ./attention_forward 1
@@ -23,7 +23,19 @@ this turns out to be ~20X faster than (1) nice
 version 4 is a further optimized kernel that fuses the scale operation,
 uses a directly autoregressive softmax, and uses the online softmax algorithm.
 ./attention_forward 4
+
+version 5 is a FP16 version of version 4.
+./attention_forward 4
+
+version 6 is using cuDNN Flaxh Attention, see:
+https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md
+./attention_forward 6
+
+If you do not have CUDNN, you can remove ENABLE_CUDNN to run the other kernels
+You need cuDNN from:https://developer.nvidia.com/cudnn
+And the cuDNN front-end from: https://github.com/NVIDIA/cudnn-frontend/tree/main
 */
+#define ENABLE_CUDNN
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,14 +45,17 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-
-#include <cudnn_frontend.h>
 #include "common.h"
 
+#ifdef ENABLE_CUDNN
+#include <cudnn_frontend.h>
 namespace fe = cudnn_frontend;
+
 #define checkCudaErr(err) assert((int)err == 0);
 #define checkCudnnErr(err) assert((int)err == 0);
-
+#define DATATYPE_16BIT half // or __nv_bfloat16 (for cuDNN kernels only)
+#define CUDNN_16BIT fe::DataType_t::HALF // or BFLOAT16 (for cuDNN kernels only)
+#endif
 // ----------------------------------------------------------------------------
 // CUDA setup
 
@@ -960,8 +975,7 @@ void attention_forward5(float* out, float* vaccum, float* qkvr, float* preatt, f
     }
 }
 
-#define DATATYPE_16BIT half // or __nv_bfloat16
-#define CUDNN_16BIT fe::DataType_t::HALF // or BFLOAT16
+#ifdef ENABLE_CUDNN
 
 // TODO simplified version of wrapper taken from cuDNN samples, remove/replace this eventually?
 template <typename T_ELEM>
@@ -1013,7 +1027,6 @@ auto lookup_cache_or_build_graph(cudnnHandle_t handle, Args... args) {
           s_kv,
           d,
           is_inference,
-          is_attn_scale,
           causal_mask,
           use_dropout_with_rng,
           dropout_probability] = std::make_tuple(args...);
@@ -1039,32 +1052,32 @@ auto lookup_cache_or_build_graph(cudnnHandle_t handle, Args... args) {
                                .set_dim({b, h, s_kv, d})
                                .set_stride({3 * h * d * s_kv, d, 3 * h * d, 1}));
 
-    auto attn_scale = is_attn_scale ? graph->tensor(fe::graph::Tensor_attributes()
-                                                        .set_name("attn_scale")
-                                                        .set_dim({1, 1, 1, 1})
-                                                        .set_stride({1, 1, 1, 1})
-                                                        .set_is_pass_by_value(true)
-                                                        .set_data_type(fe::DataType_t::FLOAT))
-                                    : nullptr;
+    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes()
+                                .set_name("attn_scale")
+                                .set_dim({1, 1, 1, 1})
+                                .set_stride({1, 1, 1, 1})
+                                .set_is_pass_by_value(true)
+                                .set_data_type(fe::DataType_t::FLOAT));
+    
     auto seed = use_dropout_with_rng ? graph->tensor(fe::graph::Tensor_attributes()
                                                          .set_name("Seed")
                                                          .set_dim({1, 1, 1, 1})
                                                          .set_stride({1, 1, 1, 1})
                                                          .set_data_type(fe::DataType_t::INT32))
                                      : nullptr;
+    
     auto offset = use_dropout_with_rng ? graph->tensor(fe::graph::Tensor_attributes()
                                                            .set_name("Offset")
                                                            .set_dim({1, 1, 1, 1})
                                                            .set_stride({1, 1, 1, 1})
                                                            .set_data_type(fe::DataType_t::INT32))
                                        : nullptr;
+    
 
     auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
     sdpa_options.set_is_inference(is_inference);
     sdpa_options.set_causal_mask(causal_mask);
-    if (is_attn_scale) {
-        sdpa_options.set_attn_scale(attn_scale);
-    };
+    sdpa_options.set_attn_scale(attn_scale);
     if (use_dropout_with_rng) {
         sdpa_options.set_dropout(dropout_probability, seed, offset);
     }
@@ -1120,7 +1133,6 @@ void attention_forward6(float* out, float* vaccum, float* qkvr, const float* inp
     int64_t s_qkv = T; // sequence length (number of tokens)
     int64_t d = C / NH; // number of features per head
     bool is_inference         = true;
-    bool is_attn_scale        = true;
     bool causal_mask          = true;
     bool use_dropout_with_rng = false;
     float attn_scale_cpu = 1.0 / sqrtf(d);
@@ -1143,7 +1155,6 @@ void attention_forward6(float* out, float* vaccum, float* qkvr, const float* inp
                                     s_qkv,
                                     d,
                                     is_inference,
-                                    is_attn_scale,
                                     causal_mask,
                                     use_dropout_with_rng,
                                     0.0f);
@@ -1177,7 +1188,7 @@ void attention_forward6(float* out, float* vaccum, float* qkvr, const float* inp
     cudnnInit = true;
 }
 
-
+#endif // ENABLE_CUDNN
 
 // kernel version dispatch
 void attention_forward(int kernel_num,
@@ -1201,9 +1212,11 @@ void attention_forward(int kernel_num,
         case 5:
             attention_forward5(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
             break;
+#ifdef ENABLE_CUDNN
         case 6:
             attention_forward6(out, vaccum, qkvr, inp, B, T, C, NH);
             break;
+#endif
         default:
             printf("Invalid kernel number\n");
             exit(1);
