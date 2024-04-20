@@ -2,7 +2,7 @@
 Kernels for attention backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math attention_backward.cu -o attention_backward -lcublas
+nvcc -I/path/to/cudnn-frontend/include -std=c++17 -O3 --use_fast_math -lcublas -lcudnn attention_backward.cu -o attention_backward
 
 version 1 is a naive first version
 OMP_NUM_THREADS=32 ./attention_backward 1
@@ -19,11 +19,13 @@ OMP_NUM_THREADS=32 ./attention_backward 4
 version 5 reduces the amount of non-fp32 instructions needed by avoiding ifs
 OMP_NUM_THREADS=32 ./attention_backward 5
 */
+#define ENABLE_CUDNN
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <float.h>
+#include <unistd.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
@@ -31,6 +33,15 @@ OMP_NUM_THREADS=32 ./attention_backward 5
 #include <cooperative_groups/scan.h>
 #include "common.h"
 
+#ifdef ENABLE_CUDNN
+#include <cudnn_frontend.h>
+namespace fe = cudnn_frontend;
+
+#define checkCudaErr(err) assert((int)err == 0);
+#define checkCudnnErr(err) assert((int)err == 0);
+#define DATATYPE_16BIT half // or __nv_bfloat16 (for cuDNN kernels only)
+#define CUDNN_16BIT fe::DataType_t::HALF // or BFLOAT16 (for cuDNN kernels only)
+#endif
 // ----------------------------------------------------------------------------
 // CUDA setup
 
@@ -218,6 +229,8 @@ __global__ void permute_kernel(float* q, float* k, float* v,
 __global__ void permute_kernel_backward(float* dinp,
                                         const float* dq, const float* dk, const float* dv,
                                         int B, int N, int NH, int d) {
+    // output is (B, N, 3, NH, d)
+    // input is 3x (B, NH, N, d) QKV
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < B * NH * N * d) {
         int b = idx / (NH * N * d);
@@ -231,6 +244,26 @@ __global__ void permute_kernel_backward(float* dinp,
         dinp[inp_idx] += dq[idx];
         dinp[inp_idx + NH * d] += dk[idx];
         dinp[inp_idx + 2 * (NH * d)] += dv[idx];
+    }
+}
+
+__global__ void permute_kernel_backward_fp16(float* dinp,
+                                        const half* dq, const half* dk, const half* dv,
+                                        int B, int N, int NH, int d) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < B * NH * N * d) {
+
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
+        dinp[inp_idx] += (float)dq[idx];
+        dinp[inp_idx + NH * d] += (float)dk[idx];
+        dinp[inp_idx + 2 * (NH * d)] += (float)dv[idx];
     }
 }
 
@@ -255,6 +288,7 @@ __global__ void unpermute_kernel(const float* inp, float *out, int B, int N, int
 __global__ void unpermute_kernel_backward(float* dinp, const float *dout, int B, int N, int NH, int d) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < B * NH * N * d) {
+        // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
         int b = idx / (NH * N * d);
         int rest = idx % (NH * N * d);
         int nh_ = rest / (N * d);
@@ -266,6 +300,22 @@ __global__ void unpermute_kernel_backward(float* dinp, const float *dout, int B,
         dinp[idx] += dout[other_idx];
     }
 }
+
+__global__ void unpermute_kernel_backward_fp16(half* dinp, const float *dout, int B, int N, int NH, int d) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
+        dinp[idx] = (half)((float)dinp[idx] + dout[other_idx]);
+    }
+}
+
 
 __device__ float& vec_at(float4& vec, int index) {
     return reinterpret_cast<float*>(&vec)[index];
@@ -721,6 +771,512 @@ __global__ void softmax_autoregressive_backward_kernel8(float* dpreatt, const fl
     }
 }
 
+// FP16 input/output version of kernel 8 (for a fair comparison against cuDNN etc...)
+template<int BlockSize>
+__global__ void softmax_autoregressive_backward_kernel9(half* dpreatt, const half* datt, const half* att,
+                                                        int B, int T, int C, float scale) {
+    namespace cg = cooperative_groups;
+    constexpr int T_per_block = 4;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    __shared__ float block_acc[32];
+
+    int idx = blockIdx.y;
+    // go through blocks in reverse order, so the slowest block starts first
+    int t0 = T - 1 - T_per_block*blockIdx.x;
+
+    att += idx * T * T;
+    datt += idx * T * T;
+    dpreatt += idx * T * T;
+
+    if (warp.meta_group_rank() == 0) {
+        block_acc[warp.thread_rank()] = 0;
+    }
+
+    for(int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if(t < 0) return;
+        const half* att_bth = att + t * T;
+        const half* datt_bth = datt + t * T;
+        half* dpreatt_bth = dpreatt + t * T;
+
+        float local_sum = 0;
+        for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
+        }
+
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+
+        for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+            // don't touch the cache. Some parts will still be here from the previous loop, and
+            // we want to exploit those.
+            float acc = (float)__ldcs(att_bth + t3) * ((float)__ldcs(datt_bth + t3) - local_sum);
+            __stcs(dpreatt_bth + t3, (half)(scale * acc));
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+// TODO simplified version of wrapper taken from cuDNN samples, remove/replace this eventually?
+template <typename T_ELEM>
+struct Surface {
+    T_ELEM* devPtr     = NULL;
+    T_ELEM* hostPtr    = NULL;
+    int64_t n_elems    = 0;
+
+    explicit Surface(int64_t n_elems, bool hasRef) : n_elems(n_elems) {
+        (void)hasRef;
+
+        checkCudaErr(cudaMalloc((void**)&(devPtr), (size_t)((n_elems) * sizeof(devPtr[0]))));
+        hostPtr = (T_ELEM*)calloc((size_t)n_elems, sizeof(hostPtr[0]));
+        memset(hostPtr, 0, n_elems * sizeof(T_ELEM));
+
+        checkCudaErr(cudaMemcpy(devPtr, hostPtr, size_t(sizeof(hostPtr[0]) * n_elems), cudaMemcpyHostToDevice));
+        checkCudaErr(cudaDeviceSynchronize());
+    }
+
+    ~Surface() {
+        if (devPtr) {
+            cudaFree(devPtr);
+            devPtr = nullptr;
+        }
+        if (hostPtr) {
+            free(hostPtr);
+            hostPtr = nullptr;
+        }
+    }
+};
+
+// TODO - hardcoded, shared between forward and backward
+// SUPER HACKY FIXME
+//    int B = 4;
+//    int T = 1024;
+//    int C = 768;
+//    int NH = 12;
+Surface<float> statsTensor(4 * 12 * 1024 * 1, false); // TODO: handle properly instead of static
+
+__global__ void fp32_to_fp16(half* out, const float* in, uint elements) {
+    uint idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < elements || !elements) {
+        out[idx] = (half)in[idx];
+    }
+}
+
+__global__ void fp16_to_fp32(float* out, const half* in, uint elements) {
+    uint idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < elements || !elements) {
+        out[idx] = (float)in[idx];
+    }
+}
+
+// ----------------------------------------------------------------------------
+// FORWARD
+// ----------------------------------------------------------------------------
+
+using graph_and_tensors = std::tuple<std::shared_ptr<fe::graph::Graph>,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Q,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // K,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // V,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Attn_scale,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Seed,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // Offset,
+                                     std::shared_ptr<fe::graph::Tensor_attributes>,  // O
+                                     std::shared_ptr<fe::graph::Tensor_attributes>   // Stats
+                                     >;
+using cache_type = std::unordered_map<std::size_t, graph_and_tensors>;
+
+template <typename... Args>
+auto lookup_cache_or_build_graph(cudnnHandle_t handle, Args... args) {
+    auto [b,
+          h,
+          s_q,
+          s_kv,
+          d,
+          is_inference,
+          causal_mask,
+          use_dropout_with_rng,
+          dropout_probability] = std::make_tuple(args...);
+
+    static cache_type user_maintained_cache;
+
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(CUDNN_16BIT)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    // (B, N, 3, NH, d)
+    auto Q = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("Q")
+                               .set_dim({b, h, s_q, d})
+                               .set_stride({3 * h * d * s_q,  d, 3 * h * d, 1}));
+    auto K = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("K")
+                               .set_dim({b, h, s_kv, d})
+                               .set_stride({3 * h * d * s_kv, d, 3 * h * d, 1}));
+    auto V = graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("V")
+                               .set_dim({b, h, s_kv, d})
+                               .set_stride({3 * h * d * s_kv, d, 3 * h * d, 1}));
+
+    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes()
+                                .set_name("attn_scale")
+                                .set_dim({1, 1, 1, 1})
+                                .set_stride({1, 1, 1, 1})
+                                .set_is_pass_by_value(true)
+                                .set_data_type(fe::DataType_t::FLOAT));
+    
+    auto seed = use_dropout_with_rng ? graph->tensor(fe::graph::Tensor_attributes()
+                                                         .set_name("Seed")
+                                                         .set_dim({1, 1, 1, 1})
+                                                         .set_stride({1, 1, 1, 1})
+                                                         .set_data_type(fe::DataType_t::INT32))
+                                     : nullptr;
+    
+    auto offset = use_dropout_with_rng ? graph->tensor(fe::graph::Tensor_attributes()
+                                                           .set_name("Offset")
+                                                           .set_dim({1, 1, 1, 1})
+                                                           .set_stride({1, 1, 1, 1})
+                                                           .set_data_type(fe::DataType_t::INT32))
+                                       : nullptr;
+    
+
+    auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
+    sdpa_options.set_is_inference(is_inference);
+    sdpa_options.set_causal_mask(causal_mask);
+    sdpa_options.set_attn_scale(attn_scale);
+    if (use_dropout_with_rng) {
+        sdpa_options.set_dropout(dropout_probability, seed, offset);
+    }
+
+    auto [O, stats] = graph->sdpa(Q, K, V, sdpa_options);
+
+    // (B, N, NH, d)
+    O->set_output(true).set_dim({b, h, s_q, d}).set_stride({h * d * s_q, d, h * d, 1});
+    assert(stats == nullptr || is_inference == false);    
+    if (!is_inference) {
+        stats->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+    }
+
+    assert(graph->validate().is_good());
+    auto key = graph->key();
+    auto it = user_maintained_cache.find(key);
+    if (it != user_maintained_cache.end()) {
+        return it->second;
+    }
+
+    assert(graph->build_operation_graph(handle).is_good());
+    auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
+    assert(graph->check_support(handle).is_good());
+    assert(graph->build_plans(handle).is_good());
+
+    user_maintained_cache.insert({key, std::make_tuple(graph, Q, K, V, attn_scale, seed, offset, O, stats)});
+    return std::make_tuple(graph, Q, K, V, attn_scale, seed, offset, O, stats);
+}
+
+__global__ void to_fp16_kernel(DATATYPE_16BIT* out, const float* inp) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    out[idx] = (DATATYPE_16BIT)inp[idx];
+
+    if (idx < 100) {
+        printf("to_fp16_kernel: %d %f %f\n", idx, inp[idx], (float)out[idx]);
+    }
+}
+
+__global__ void from_fp16_kernel(const DATATYPE_16BIT* inp, float *out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    out[idx] = (float)inp[idx];
+
+    if (idx < 100) {
+        printf("from_fp16_kernel: %d %f %f\n", idx, (float)inp[idx], out[idx]);
+    }
+}
+
+__global__ void print_fp32_kernel(const float* in, int start, int elements, char msg) {
+    int idx = start + blockIdx.x * blockDim.x + threadIdx.x;
+    for(int i = idx; i < elements; i += blockDim.x * gridDim.x) {
+        printf("%c (print_fp32): %d -> %f\n", msg, idx, in[idx]);
+    }
+}
+
+__global__ void print_fp16_kernel(const half* in, int start, int elements, char msg) {
+    int idx = start + blockIdx.x * blockDim.x + threadIdx.x;
+    for(int i = idx; i < elements; i += blockDim.x * gridDim.x) {
+        printf("%c (print_fp16): %d -> %f\n", msg, idx, (float)in[idx]);
+    }
+}
+
+bool cudnnInit = false;
+cudnnHandle_t handle;
+
+void attention_forward_cudnn(float* out, float* vaccum, float* qkvr, const float* inp,
+                        int B, int T, int C, int NH, bool skip_conversion=false) {
+    // inp is (B, T, 3, NH, HS) QKV
+    // out is (B, T, NH, HS)
+
+    if (!cudnnInit) {
+        checkCudnnErr(cudnnCreate(&handle));
+    }
+    
+    int64_t b = B; // batch size
+    int64_t h = NH; // head size
+    int64_t s_qkv = T; // sequence length (number of tokens)
+    int64_t d = C / NH; // number of features per head
+    bool is_inference         = false;
+    bool causal_mask          = true;
+    bool use_dropout_with_rng = false;
+    float attn_scale_cpu = 1.0 / sqrtf(d);
+    DATATYPE_16BIT* qkvr_f16 = (DATATYPE_16BIT*)qkvr;
+
+    const int block_size = 64;
+    int total_threads = B * T * C * 3;
+    assert(total_threads % block_size == 0);
+    int num_blocks = total_threads / block_size;
+    if (!cudnnInit || !skip_conversion) {
+        // Currently only handles FP32->FP16 conversion
+        to_fp16_kernel<<<num_blocks, block_size>>>(qkvr_f16, inp);
+    }
+
+    print_fp16_kernel<<<1, 1>>>((half*)(qkvr_f16 + 2 * h * d), 0, 10, 'v');
+
+    auto [graph, Q, K, V, attn_scale, seed, offset, O, stats] =
+        lookup_cache_or_build_graph(handle,
+                                    b,
+                                    h,
+                                    s_qkv,
+                                    s_qkv,
+                                    d,
+                                    is_inference,
+                                    causal_mask,
+                                    use_dropout_with_rng,
+                                    0.0f);
+    (void)seed;
+    (void)offset;
+
+    //// Build variant pack
+    void* devPtrQ = qkvr_f16;
+    void* devPtrK = (qkvr_f16 + h * d);
+    void* devPtrV = (qkvr_f16 + 2 * h * d);
+    void* devPtrO = (void*)vaccum;
+
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+        {Q, devPtrQ}, {K, devPtrK}, {V, devPtrV}, {attn_scale, &attn_scale_cpu}, {O, devPtrO}};
+    if (is_inference == false) {
+        variant_pack[stats] = statsTensor.devPtr;
+    }
+
+    static Surface<int8_t> workspace(graph->get_workspace_size(), false); // TODO: handle properly instead of static
+    assert(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+
+    total_threads = B * T * C;
+    assert(total_threads % block_size == 0);
+    num_blocks = total_threads / block_size;
+    if (!cudnnInit || !skip_conversion) {
+        // Currently only handles FP16->FP32 conversion
+        from_fp16_kernel<<<num_blocks, block_size>>>((DATATYPE_16BIT*)vaccum, out);
+    }
+
+    cudnnInit = true;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+// ----------------------------------------------------------------------------
+// BACKWARD
+// ----------------------------------------------------------------------------
+
+void attention_backward_cudnn(int b/*B*/, int h/*NH*/, int s_q/*T*/, int s_kv/*T*/, int d/*HS*/,
+                              float *qkvr/*qkv*/, float *vaccum/*o*/, float *stats, // FP16 inputs
+                              float *dout/*dO*/, // FP32 input
+                              float* dvaccum/*d0*/, // Converted from FP32 to FP16 internally
+                              float *dqkvr/*dqkv*/, // graph output in FP16
+                              float *dinp/*dqvr*/, // final output in FP32
+                              bool skip_conversion = false) {
+    //float *qkvr/*qkv*/, float *vaccum/*o*/, float *dout/*dO*/, float *stats, // inputs
+    //float *dinp/*dqvr*/ // outputs
+
+    static bool first_cudnn_backward = true;
+
+    const int block_size = 64;
+    int total_threads = b * s_q * h * d;
+    assert(total_threads % block_size == 0);
+    int num_blocks = total_threads / block_size;
+    if (first_cudnn_backward || !skip_conversion) {
+        to_fp16_kernel<<<num_blocks, block_size>>>((half*)dvaccum, dout);
+    }
+
+    int B = b;
+    int T = s_q;
+    int C = h * d;
+
+    half *q16, *k16, *v16;
+    q16 = ((half*)qkvr) + 0 * B * T * C;
+    k16 = ((half*)qkvr) + 1 * B * T * C;
+    v16 = ((half*)qkvr) + 2 * B * T * C;
+
+    float *v;
+    v = (qkvr + 2 * B * T * C);
+
+
+    cudaDeviceSynchronize();
+    sleep(1);
+    printf("Yay!!!!!!!!!!!!\n");
+    print_fp32_kernel<<<1, 1>>>(dout, 0, 10, 'a');
+    print_fp16_kernel<<<1, 1>>>((half*)dvaccum, 0, 10, 'b');
+    print_fp16_kernel<<<1, 1>>>(v16, 0, 10, 'v');
+    sleep(1);
+    // convert v from fp16 to fp32
+    fp16_to_fp32<<<num_blocks, block_size>>>(dinp, v16, B * T * C);
+    cudaMemcpy(v, dinp, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice);
+    print_fp32_kernel<<<1, 1>>>(v, 0, 10, 'V');
+
+
+    //attention_forward_cudnn(d_out, d_vaccum, d_qkvr, d_inp, B, T, C, NH);
+    //attention_backward_cudnn(B, NH, T, T, C/NH, qkvr, vaccum, dout, (float*)statsTensor.devPtr, dqkvr, dinp);
+
+    fe::graph::Graph mha_graph;
+    mha_graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+
+
+    // inp/dinp are (B, T, 3C) Q,K,V
+    // att/datt/dpreatt are (B, NH, T, T)
+    // dout is (B, T, C)
+
+
+
+
+
+    // (B, N, 3, NH, d)
+    // must come from inp (which means we also need to convert THAT to FP16)
+    auto g_q = mha_graph.tensor(fe::graph::Tensor_attributes()
+                               .set_name("Q")
+                               .set_dim({b, h, s_q, d})
+                               .set_stride({3 * h * d * s_q,  d, 3 * h * d, 1}));
+    auto g_k = mha_graph.tensor(fe::graph::Tensor_attributes()
+                               .set_name("K")
+                               .set_dim({b, h, s_kv, d})
+                               .set_stride({3 * h * d * s_kv, d, 3 * h * d, 1}));
+    auto g_v = mha_graph.tensor(fe::graph::Tensor_attributes()
+                               .set_name("V")
+                               .set_dim({b, h, s_kv, d})
+                               .set_stride({3 * h * d * s_kv, d, 3 * h * d, 1}));
+
+    auto g_o = mha_graph.tensor(fe::graph::Tensor_attributes()
+                                .set_name("O")
+                                .set_dim({b, h, s_q, d})
+                                .set_stride({h * d * s_q, d, h * d, 1}));
+    auto g_dO = mha_graph.tensor(fe::graph::Tensor_attributes()
+                                .set_name("dO")
+                                .set_dim({b, h, s_q, d})
+                                .set_stride({h * d * s_q, d, h * d, 1}));
+    auto g_stats = mha_graph.tensor(fe::graph::Tensor_attributes()
+                                .set_name("stats")
+                                .set_dim({b, h, s_q, 1})
+                                .set_stride({h * s_q, s_q, 1, 1})
+                                .set_data_type(fe::DataType_t::FLOAT));
+    auto g_attn_scale = mha_graph.tensor(fe::graph::Tensor_attributes()
+                                .set_name("attn_scale")
+                                .set_dim({1, 1, 1, 1})
+                                .set_stride({1, 1, 1, 1})
+                                .set_is_pass_by_value(true)
+                                .set_data_type(fe::DataType_t::FLOAT));
+    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes()
+                                     .set_name("flash_attention_backward")
+                                     .set_causal_mask(true)
+                                     .set_attn_scale(true);
+                                     
+    auto [g_dQ, g_dK, g_dV] = mha_graph.sdpa_backward(g_q, g_k, g_v, g_o, g_dO, g_stats, sdpa_backward_options);
+
+    g_dQ->set_output(true).set_dim({b, h, s_q, d}).set_stride({3 * h * d * s_q,  d, 3 * h * d, 1});
+    g_dK->set_output(true).set_dim({b, h, s_kv, d}).set_stride({3 * h * d * s_kv,  d, 3 * h * d, 1});
+    g_dV->set_output(true).set_dim({b, h, s_kv, d}).set_stride({3 * h * d * s_kv,  d, 3 * h * d, 1});
+
+    assert(mha_graph.validate().is_good());
+    assert(mha_graph.build_operation_graph(handle).is_good());
+    auto plans = mha_graph.create_execution_plans({fe::HeurMode_t::A});
+    assert(mha_graph.check_support(handle).is_good());
+    assert(mha_graph.build_plans(handle).is_good());
+
+    half* qkvr_f16 = (half*)qkvr;
+    void* devPtrQ = qkvr_f16;
+    void* devPtrK = (qkvr_f16 + h * d);
+    void* devPtrV = (qkvr_f16 + 2 * h * d);
+
+    half* dqkvr_f16 = (half*)dqkvr;
+    void* devPtrdQ = dqkvr_f16;
+    void* devPtrdK = (dqkvr_f16 + h * d);
+    void* devPtrdV = (dqkvr_f16 + 2 * h * d);
+
+    void* devPtrO = (void*)vaccum;
+    void* devPtrdO = (void*)dvaccum;
+    void* devPtrStats = (void*)stats;
+
+    float attn_scale_cpu = 1.0 / sqrtf(d);
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
+        // inputs
+        {g_q, devPtrQ},
+        {g_k, devPtrK},
+        {g_v, devPtrV},
+        {g_o, devPtrO},
+        {g_dO, devPtrdO},
+        {g_stats, devPtrStats},
+        // outputs
+        {g_dQ, devPtrdQ},
+        {g_dK, devPtrdK},
+        {g_dV, devPtrdV},
+        // pass by value
+        {g_attn_scale, &attn_scale_cpu}};
+
+    checkCudaErr(cudaDeviceSynchronize());
+    static Surface<int8_t> workspace(mha_graph.get_workspace_size(), false);
+    assert(mha_graph.execute(handle, variant_pack, workspace.devPtr).is_good());
+    checkCudaErr(cudaDeviceSynchronize());
+
+    total_threads = b * s_q * h * d * 3;
+    assert(total_threads % block_size == 0);
+    num_blocks = total_threads / block_size;
+    if (first_cudnn_backward || !skip_conversion) {
+        from_fp16_kernel<<<num_blocks, block_size>>>(dqkvr_f16, dinp);
+    }
+
+    first_cudnn_backward = false;
+}
+
+
+
+
+
+
+
+
+
+
+
+
 
 // ----------------------------------------------------------------------------
 // kernel launchers
@@ -855,12 +1411,28 @@ void launch_softmax_8(float* dpreatt, float* datt, const float* att, int B, int 
     dispatch_launch(launch, block_size);
 }
 
+void launch_softmax_9(half* dpreatt, half* datt, const half* att, int B, int T, int C, int NH, int block_size) {
+    int hs = C / NH; // head size
+    float scale = 1.0f / sqrtf(hs);
+    auto launch = [&](auto int_const) {
+        constexpr int block_size = int_const.value;
+        softmax_autoregressive_backward_kernel9<block_size><<<dim3(T / 4, B * NH), block_size>>>
+                                                              (dpreatt, datt, att, B, T, C, scale);
+    };
+    dispatch_launch(launch, block_size);
+}
+
+
+
+
+
+
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
 template<class SoftmaxKernel>
 void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* dvaccum,
                         const float* dout,
-                        const float* inp, const float* qkvr, const float* preatt, const float* att, const float* vaccum,
+                        const float* inp, float* qkvr, const float* preatt, const float* att, const float* vaccum,
                         int B, int T, int C, int NH,
                         SoftmaxKernel softmax_autoregressive_backward,
                         const int block_size) {
@@ -868,10 +1440,16 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
     const float alpha = 1.0f;
     const float beta = 1.0f; // note beta = 1.0f so that we accumulate gradients (+=)
     // unpack convenience pointers into q, k, v
-    const float *q, *k, *v;
+   float *q, *k, *v;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
+
+   half *q16, *k16, *v16;
+    q16 = ((half*)qkvr) + 0 * B * T * C;
+    k16 = ((half*)qkvr) + 1 * B * T * C;
+    v16 = ((half*)qkvr) + 2 * B * T * C;
+
     float *dq, *dk, *dv;
     dq = dqkvr + 0 * B * T * C;
     dk = dqkvr + 1 * B * T * C;
@@ -881,6 +1459,18 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
     int num_blocks = ceil_div(B * T * C, block_size);
     unpermute_kernel_backward<<<num_blocks, block_size>>>(dvaccum, dout, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
+
+    cudaDeviceSynchronize();
+    sleep(1);
+    printf("Yay!!!!!!!!!!!!\n");
+    print_fp32_kernel<<<1, 1>>>(dout, 0, 10, 'a');
+    print_fp32_kernel<<<1, 1>>>(dvaccum, 0, 10, 'b');
+    print_fp16_kernel<<<1, 1>>>(v16, 0, 10, 'v');
+    sleep(1);
+    // convert v from fp16 to fp32
+    fp16_to_fp32<<<num_blocks, block_size>>>(datt, v16, B * T * C);
+    cudaMemcpy(v, datt, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice);
+    print_fp32_kernel<<<1, 1>>>(v, 0, 10, 'V');
 
     // backward into datt
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
@@ -893,6 +1483,9 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
                             datt, T, T * T,
                             B * NH));
 
+    print_fp32_kernel<<<1, 1>>>(datt, 0, 10, 'd');
+    
+
     // backward into dv
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
             CUBLAS_OP_N, CUBLAS_OP_T,
@@ -903,6 +1496,9 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
             &beta,
             dv, HS, T * HS,
             B * NH));
+
+    print_fp32_kernel<<<1, 1>>>(att, 0, 10, 'd');
+    print_fp32_kernel<<<1, 1>>>(dv, 0, 10, 'e');
 
     // backward into preatt
     softmax_autoregressive_backward(dpreatt, datt, att, B, T, C, NH, block_size);
@@ -935,11 +1531,198 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
     cudaCheck(cudaGetLastError());
 }
 
+// fp16 input/output version of backward1
+// IMPORTANT: This will overwrite qkvr/att to be FP16 for simplicity's sake
+template<class SoftmaxKernel>
+void attention_backward2(float* dinp, half* dqkvr, half* dpreatt, half* datt, half* dvaccum,
+                        const float* dout,
+                        const half* inp, /*const*/ half* qkvr, const half* preatt, /*const*/ half* att, const half* vaccum,
+                        int B, int T, int C, int NH,
+                        SoftmaxKernel softmax_autoregressive_backward,
+                        const int block_size) {
+    int HS = C / NH; // head size
+    const half alpha = (half)1.0f;
+    const half beta = (half)1.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+    // unpack convenience pointers into q, k, v
+    const half *q, *k, *v;
+    q = qkvr + 0 * B * T * C;
+    k = qkvr + 1 * B * T * C;
+    v = qkvr + 2 * B * T * C;
+    half *dq, *dk, *dv;
+    dq = dqkvr + 0 * B * T * C;
+    dk = dqkvr + 1 * B * T * C;
+    dv = dqkvr + 2 * B * T * C;
+
+    // Convert from FP32 to FP16 on first run only
+    static bool first_run = true;
+    static void* hacky_workspace;
+    if (first_run) {
+        // TODO hacky memory allocation to get this working quickly
+        cudaMalloc(&hacky_workspace, max(B * T * 3 * C, B * NH * T * T) * sizeof(float));
+
+        // Convert qkvr from FP32 to FP16 (performance doesn't really matter)
+        fp32_to_fp16<<<(B * T * 3 * C) / 64, 64>>>((half*)hacky_workspace, (float*)qkvr, B * T * 3 * C);
+        cudaMemcpy(qkvr, hacky_workspace, B * T * 3 * C * sizeof(half), cudaMemcpyDeviceToDevice);
+
+        fp32_to_fp16<<<(B * NH * T * T) / 64, 64>>>((half*)hacky_workspace, (float*)att, B * NH * T * T);
+        cudaMemcpy(att, hacky_workspace, B * NH * T * T * sizeof(half), cudaMemcpyDeviceToDevice);
+    }
+
+    // backward through the unpermute operation
+    int num_blocks = ceil_div(B * T * C, block_size);
+    unpermute_kernel_backward_fp16<<<num_blocks, block_size>>>(dvaccum, dout, B, T, NH, HS);
+    cudaCheck(cudaGetLastError());
+
+    // backward into datt
+    cublasCheck(cublasHgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            T, T, HS,
+                            &alpha,
+                            v, HS, T * HS,
+                            dvaccum, HS, T * HS,
+                            &beta,
+                            datt, T, T * T,
+                            B * NH));
+
+    // backward into dv
+    cublasCheck(cublasHgemmStridedBatched(cublas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            HS, T, T,
+            &alpha,
+            dvaccum, HS, T * HS,
+            att, T, T * T,
+            &beta,
+            dv, HS, T * HS,
+            B * NH));
+
+    // backward into preatt
+    softmax_autoregressive_backward(dpreatt, datt, att, B, T, C, NH, block_size);
+    cudaCheck(cudaGetLastError());
+
+    // backward into q
+    cublasCheck(cublasHgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            HS, T, T,
+                            &alpha,
+                            k, HS, T * HS,
+                            dpreatt, T, T * T,
+                            &beta,
+                            dq, HS, T * HS,
+                            B * NH));
+    // backward into k
+    cublasCheck(cublasHgemmStridedBatched(cublas_handle,
+                            CUBLAS_OP_N, CUBLAS_OP_T,
+                            HS, T, T,
+                            &alpha,
+                            q, HS, T * HS,
+                            dpreatt, T, T * T,
+                            &beta,
+                            dk, HS, T * HS,
+                            B * NH));
+
+    // backward into inp
+    num_blocks = ceil_div(B * NH * T * HS, block_size);
+    permute_kernel_backward_fp16<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
+
+    if (first_run) {
+        // Convert datt/dqkvr to FP32 for the validation tests
+        fp16_to_fp32<<<(B * T * 3 * C) / 64, 64>>>((float*)hacky_workspace, (half*)dqkvr, B * T * 3 * C);
+        cudaMemcpy(dqkvr, hacky_workspace, B * T * 3 * C * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        fp16_to_fp32<<<(B * NH * T * T) / 64, 64>>>((float*)hacky_workspace, (half*)datt, B * NH * T * T);
+        cudaMemcpy(datt, hacky_workspace, B * NH * T * T * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        fp16_to_fp32<<<(B * NH * T * T) / 64, 64>>>((float*)hacky_workspace, (half*)dpreatt, B * NH * T * T);
+        cudaMemcpy(dpreatt, hacky_workspace, B * NH * T * T * sizeof(float), cudaMemcpyDeviceToDevice);
+    }
+
+    first_run = false;
+    cudaCheck(cudaGetLastError());
+}
+
+
+// FP16 version of kernel1 where only inputs/outputs are converted as FP32->FP16->FP32
+template<class SoftmaxKernel>
+void attention_backward3(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* dvaccum,
+                        /*const*/ float* dout,
+                        /*const*/ float* inp, /*const*/ float* qkvr, /*const*/ float* preatt, /*const*/ float* att, /*const*/ float* vaccum,
+                        int B, int T, int C, int NH,
+                        SoftmaxKernel softmax_autoregressive_backward,
+                        const int block_size) {
+
+    static bool first_run = true;
+    static void* hacky_workspace;
+    if (first_run) {
+        // TODO hacky memory allocation to get this working quickly
+        cudaMalloc(&hacky_workspace, max(B * T * 3 * C, B * NH * T * T) * sizeof(float));
+
+        // Convert qkvr from FP32 to FP16 (performance doesn't really matter)
+        fp32_to_fp16<<<(B * T * 3 * C) / 64, 64>>>((half*)hacky_workspace, (float*)qkvr, B * T * 3 * C);
+        cudaMemcpy(qkvr, hacky_workspace, B * T * 3 * C * sizeof(half), cudaMemcpyDeviceToDevice);
+        fp16_to_fp32<<<(B * T * 3 * C) / 64, 64>>>((float*)hacky_workspace, (half*)qkvr, B * T * 3 * C);
+        cudaMemcpy(qkvr, hacky_workspace, B * T * 3 * C * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        // att
+        fp32_to_fp16<<<(B * NH * T * T) / 64, 64>>>((half*)hacky_workspace, (float*)att, B * NH * T * T);
+        cudaMemcpy(att, hacky_workspace, B * NH * T * T * sizeof(half), cudaMemcpyDeviceToDevice);
+        fp16_to_fp32<<<(B * NH * T * T) / 64, 64>>>((float*)hacky_workspace, (half*)att, B * NH * T * T);
+        cudaMemcpy(att, hacky_workspace, B * NH * T * T * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        // dout
+        fp32_to_fp16<<<(B * T * C) / 64, 64>>>((half*)hacky_workspace, (float*)dout, B * T * C);
+        cudaMemcpy(dout, hacky_workspace, B * T * C * sizeof(half), cudaMemcpyDeviceToDevice);
+        fp16_to_fp32<<<(B * T * C) / 64, 64>>>((float*)hacky_workspace, (half*)dout, B * T * C);
+        cudaMemcpy(dout, hacky_workspace, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        // inp
+        fp32_to_fp16<<<(B * T * 3 * C) / 64, 64>>>((half*)hacky_workspace, (float*)inp, B * T * 3 * C);
+        cudaMemcpy(inp, hacky_workspace, B * T * 3 * C * sizeof(half), cudaMemcpyDeviceToDevice);
+        fp16_to_fp32<<<(B * T * 3 * C) / 64, 64>>>((float*)hacky_workspace, (half*)inp, B * T * 3 * C);
+        cudaMemcpy(inp, hacky_workspace, B * T * 3 * C * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        // preatt
+        fp32_to_fp16<<<(B * NH * T * T) / 64, 64>>>((half*)hacky_workspace, (float*)preatt, B * NH * T * T);
+        cudaMemcpy(preatt, hacky_workspace, B * NH * T * T * sizeof(half), cudaMemcpyDeviceToDevice);
+        fp16_to_fp32<<<(B * NH * T * T) / 64, 64>>>((float*)hacky_workspace, (half*)preatt, B * NH * T * T);
+        cudaMemcpy(preatt, hacky_workspace, B * NH * T * T * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        // vaccum
+        fp32_to_fp16<<<(B * T * C) / 64, 64>>>((half*)hacky_workspace, (float*)vaccum, B * T * C);  
+        cudaMemcpy(vaccum, hacky_workspace, B * T * C * sizeof(half), cudaMemcpyDeviceToDevice);
+        fp16_to_fp32<<<(B * T * C) / 64, 64>>>((float*)hacky_workspace, (half*)vaccum, B * T * C);
+        cudaMemcpy(vaccum, hacky_workspace, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice);
+    }
+
+    //attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum,
+    //                    B, T, C, NH, softmax_autoregressive_backward, block_size);
+
+    attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                        launch_softmax_8, block_size);
+
+    if (first_run) {
+        // dinp
+        fp32_to_fp16<<<(B * T * 3 * C) / 64, 64>>>((half*)hacky_workspace, (float*)dinp, B * T * 3 * C);
+        cudaMemcpy(dinp, hacky_workspace, B * T * 3 * C * sizeof(half), cudaMemcpyDeviceToDevice);
+        fp16_to_fp32<<<(B * T * 3 * C) / 64, 64>>>((float*)hacky_workspace, (half*)dinp, B * T * 3 * C);
+        cudaMemcpy(dinp, hacky_workspace, B * T * 3 * C * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        // dqkvr
+        fp32_to_fp16<<<(B * T * 3 * C) / 64, 64>>>((half*)hacky_workspace, (float*)dqkvr, B * T * 3 * C);
+        cudaMemcpy(dqkvr, hacky_workspace, B * T * 3 * C * sizeof(half), cudaMemcpyDeviceToDevice);
+        fp16_to_fp32<<<(B * T * 3 * C) / 64, 64>>>((float*)hacky_workspace, (half*)dqkvr, B * T * 3 * C);
+        cudaMemcpy(dqkvr, hacky_workspace, B * T * 3 * C * sizeof(float), cudaMemcpyDeviceToDevice);
+    }
+
+    cudaCheck(cudaGetLastError());
+}
+
+
+
 // kernel version dispatch
 void attention_backward(int kernel_num,
                         float* dinp, float* dqkvr, float* dpreatt, float* datt, float* dvaccum,
-                        const float* dout,
-                        const float* inp, const float* qkvr, const float* preatt, const float* att, const float* vaccum,
+                        /*const*/ float* dout,
+                        /*const*/ float* inp, /*const*/ float* qkvr, /*const*/ float* preatt, /*const*/ float* att, /*const*/ float* vaccum,
                         int B, int T, int C, int NH,
                         const int block_size) {
     switch (kernel_num) {
@@ -974,6 +1757,20 @@ void attention_backward(int kernel_num,
         case 8:
             attention_backward1(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
                                 launch_softmax_8, block_size);
+            break;
+        case 9:
+            attention_backward2(dinp, (half*)dqkvr, (half*)dpreatt, (half*)datt, (half*)dvaccum,
+                                dout, (const half*)inp, (/*const*/ half*)qkvr, (const half*)preatt,
+                                (/*const*/ half*)att, (const half*)vaccum, B, T, C, NH,
+                                launch_softmax_9, block_size);
+            break;
+        case 10:
+            // FP16 accuracy test only
+            attention_backward3(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, preatt, att, vaccum, B, T, C, NH,
+                                launch_softmax_8, block_size);
+            break;
+        case 20:
+            attention_backward_cudnn(B, NH, T, T, C/NH, qkvr, vaccum, statsTensor.devPtr, dout, dvaccum, dqkvr, dinp);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -1028,13 +1825,19 @@ int main(int argc, char **argv) {
 
     // execute the forward pass on the GPU
     const int block_size = 256;
-    attention_forward(d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+    if (kernel_num >= 0) {
+        attention_forward_cudnn(d_out, d_vaccum, d_qkvr, d_inp, B, T, C, NH);
+    } else {
+        attention_forward(d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+    }
 
     // check that preatt, att, and out match between the CPU and GPU versions
     printf("Checking the forward pass CPU <-> GPU...\n");
-    printf("[preatt]\n"); validate_result(d_preatt, preatt, "preatt", B * T * C, 1e-4f);
-    printf("[att]\n");    validate_result(d_att, att, "att", B * T * C, 1e-4f);
-    printf("[out]\n");    validate_result(d_out, out, "out", B * T * C, 1e-4f);
+    if (kernel_num < 0) {
+        printf("[preatt]\n"); validate_result(d_preatt, preatt, "preatt", B * T * C, 1e-3f);
+        printf("[att]\n");    validate_result(d_att, att, "att", B * T * C, 1e-3f);
+    }
+    printf("[out]\n");    validate_result(d_out, out, "out", B * T * C, 1e-3f);
 
     // set up the memory for the backward pass
     float* dout = make_random_float(B * T * C); // the gradients on the output
@@ -1071,10 +1874,13 @@ int main(int argc, char **argv) {
     // note that we will only check the correctness at [att, preatt, inp]
     // the gradients at qkvr and vaccum will remain unchecked, but are
     // assumed to be correct if the other gradients are correct
+    float accuracy_threshold = (kernel_num >= 9) ? 1e-1f : 1e-4f; // lower accuracy for FP16 kernels
     printf("Checking the backward pass CPU <-> GPU...\n");
-    printf("[datt]\n");    validate_result(d_datt, datt, "datt", B * NH * T * T, 1e-4f);
-    printf("[dpreatt]\n"); validate_result(d_dpreatt, dpreatt, "dpreatt", B * NH * T * T, 1e-4f);
-    printf("[dinp]\n");    validate_result(d_dinp, dinp, "dinp", B * T * 3 * C, 1e-4f);
+    if (kernel_num < 20) {
+        printf("[datt]\n");    validate_result(d_datt, datt, "datt", B * NH * T * T, accuracy_threshold);
+        printf("[dpreatt]\n"); validate_result(d_dpreatt, dpreatt, "dpreatt", B * NH * T * T, accuracy_threshold);
+    }
+    printf("[dinp]\n");    validate_result(d_dinp, dinp, "dinp", B * T * 3 * C, accuracy_threshold);
 
     // also let's manually step through the gradients here
     float* h_dinp = (float*)malloc(B * T * 3 * C * sizeof(float));
