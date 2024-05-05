@@ -912,11 +912,14 @@ __global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX
             x128 dout128_i   = load128(dout_bt + i);
             x128 inp128_i    = load128(inp_bt + i);
             x128 weight128_i = load128(weight + i);
+            x128 dinp128_i   = load128(dinp_bt + i);
             for (int k = 0; k < x128::size; k++) {
                 float norm_bti = ((float)inp128_i[k] - mean_bt) * rstd_bt;
                 float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
                 dnorm_mean += dnorm_i;
                 dnorm_norm_mean += dnorm_i * norm_bti;
+                // This is just a silly hack to prefetch dinp128 before the previous loop
+                dnorm_mean += ((float)dinp128_i[k] == INFINITY) ? INFINITY : 0.0f;
             }
         }
         dnorm_mean = warpReduceSum(dnorm_mean);
@@ -925,28 +928,26 @@ __global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX
         dnorm_norm_mean = dnorm_norm_mean / C;
 
         // now iterate again and accumulate all the gradients
-        for (int i = warpThreadIdx * x128::size; i < C; i += warpSize * x128::size) {
-            x128 dout128_i   = load128cs(dout_bt + i);
-            x128 inp128_i    = load128cs(inp_bt + i);
-            x128 weight128_i = load128(weight + i);
-            x128 dinp128_i =   load128(dinp_bt + i);
-            for (int k = 0; k < x128::size; k++) {
-                float dout_i = (float)dout128_i[k];
-                float norm_bti = ((float)inp128_i[k] - mean_bt) * rstd_bt;
-                float dnorm_i = (float)weight128_i[k] * dout_i;
+        // unfortunately this loop cannot easily use x128 because of the shared memory atomics
+        // because atomics are 32-bit, this would be an 8-way bank conflict, and kill performance
+        for (int n = warpThreadIdx; n < C; n += warpSize * 4) {
+            #pragma unroll 4
+            for (int i = n, x = 0; x < 4; i += warpSize, x++) {
+                float dout_i = (float)__ldcs(&dout_bt[i]);
+                float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
+                float dnorm_i = (float)weight[i] * dout_i;
                 // gradient contribution to bias
-                atomicAdd(&dbias_shared[i + k], dout_i);
+                atomicAdd(&dbias_shared[i], dout_i);
                 // gradient contribution to weight
-                atomicAdd(&dweight_shared[i + k], norm_bti * dout_i);
+                atomicAdd(&dweight_shared[i], norm_bti * dout_i);
                 // gradient contribution to input
                 float dval = 0.0f;
                 dval += dnorm_i; // term 1
                 dval -= dnorm_mean; // term 2
                 dval -= norm_bti * dnorm_norm_mean; // term 3
                 dval *= rstd_bt; // final scale
-                dinp128_i[k] = (floatX)((float)dinp128_i[k] + dval);
+                __stcs(&dinp_bt[i], (floatX)((float)dinp_bt[i] + dval));
             }
-            store128(dinp_bt + i, dinp128_i);
         }
     }
 
@@ -1122,7 +1123,8 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
 
 // same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
 // will _update_ logits to logit gradients
-__global__ void fused_classifier_kernel3(floatX* logits, floatX* losses, floatX* probs,
+__global__ void __launch_bounds__(1024, 2)
+                fused_classifier_kernel3(floatX* logits, floatX* losses, floatX* probs,
                                          const floatX* dlosses, const int* targets,
                                          int B, int T, int V, int P) {
     int idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
