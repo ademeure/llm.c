@@ -908,11 +908,16 @@ __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX
         // first: two reduce operations
         float dnorm_mean = 0.0f;
         float dnorm_norm_mean = 0.0f;
-        for (int i = warpThreadIdx; i < C; i  += warpSize) {
-            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
-            dnorm_mean += dnorm_i;
-            dnorm_norm_mean += dnorm_i * norm_bti;
+        for (int i = warpThreadIdx * x128::size; i < C; i += warpSize * x128::size) {
+            x128 dout128_i   = load128(dout_bt + i);
+            x128 inp128_i    = load128(inp_bt + i);
+            x128 weight128_i = load128(weight + i);
+            for (int k = 0; k < x128::size; k++) {
+                float norm_bti = ((float)inp128_i[k] - mean_bt) * rstd_bt;
+                float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
+                dnorm_mean += dnorm_i;
+                dnorm_norm_mean += dnorm_i * norm_bti;
+            }
         }
         dnorm_mean = warpReduceSum(dnorm_mean);
         dnorm_norm_mean = warpReduceSum(dnorm_norm_mean);
@@ -920,21 +925,28 @@ __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX
         dnorm_norm_mean = dnorm_norm_mean / C;
 
         // now iterate again and accumulate all the gradients
-        for (int i = warpThreadIdx; i < C; i += warpSize) {
-            float dout_i = (float)__ldcs(&dout_bt[i]);
-            float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * dout_i;
-            // gradient contribution to bias
-            atomicAdd(&dbias_shared[i], dout_i);
-            // gradient contribution to weight
-            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
-            // gradient contribution to input
-            float dval = 0.0f;
-            dval += dnorm_i; // term 1
-            dval -= dnorm_mean; // term 2
-            dval -= norm_bti * dnorm_norm_mean; // term 3
-            dval *= rstd_bt; // final scale
-            dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
+        for (int i = warpThreadIdx * x128::size; i < C; i += warpSize * x128::size) {
+            x128 dout128_i   = load128cs(dout_bt + i);
+            x128 inp128_i    = load128cs(inp_bt + i);
+            x128 weight128_i = load128(weight + i);
+            x128 dinp128_i =   load128(dinp_bt + i);
+            for (int k = 0; k < x128::size; k++) {
+                float dout_i = (float)dout128_i[k];
+                float norm_bti = ((float)inp128_i[k] - mean_bt) * rstd_bt;
+                float dnorm_i = (float)weight128_i[k] * dout_i;
+                // gradient contribution to bias
+                atomicAdd(&dbias_shared[i + k], dout_i);
+                // gradient contribution to weight
+                atomicAdd(&dweight_shared[i + k], norm_bti * dout_i);
+                // gradient contribution to input
+                float dval = 0.0f;
+                dval += dnorm_i; // term 1
+                dval -= dnorm_mean; // term 2
+                dval -= norm_bti * dnorm_norm_mean; // term 3
+                dval *= rstd_bt; // final scale
+                dinp128_i[k] = (floatX)((float)dinp128_i[k] + dval);
+            }
+            store128(dinp_bt + i, dinp128_i);
         }
     }
 
@@ -1050,6 +1062,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
     const floatX* x = inp + idx * P;
     float thread_maxval = -INFINITY;
     float thread_sumval = 0.0f;
+    /*
     // do the loop in reverse to maximise probability of L2 cache hits
     // so even small L2s get some hits on the 2nd read of the same thread
     for (int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
@@ -1058,6 +1071,38 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
             if (i*x128::size+k >= V) {  // bounds checking against real V
                 continue;
             }
+            float v = (float)packed_x[k];
+            float old_maxval = thread_maxval;
+            thread_maxval = fmaxf(thread_maxval, v);
+            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval += expf(v - thread_maxval);
+        }
+    }
+    */
+
+    int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x;
+
+    // bounds checking against real V (rather than padded P)
+    // handle the the unaligned elements at the end of the array here
+    // this lets us skip the bounds check in the main loop below, which improves performance
+    while ((i+1)*x128::size > V) {
+        for(int k = 0; k < x128::size; ++k) {
+            if (i*x128::size+k >= V) {
+                break;
+            }
+            float v = (float)x[i*x128::size+k];
+            float old_maxval = thread_maxval;
+            thread_maxval = fmaxf(thread_maxval, v);
+            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval += expf(v - thread_maxval);
+        }
+        i -= blockDim.x;
+    }
+
+    // main loop for the bulk of the iterations (no bounds checking required)
+    for (; i >= 0; i -= blockDim.x) {
+        x128 packed_x = load128(x + i * x128::size); // load and keep in cache until fused_classifier loop
+        for(int k = 0; k < x128::size; ++k) {
             float v = (float)packed_x[k];
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
