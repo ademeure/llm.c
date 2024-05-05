@@ -1066,14 +1066,28 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
     float thread_maxval = -INFINITY;
     float thread_sumval = 0.0f;
 
-    // do the loop in reverse to maximise probability of L2 cache hits
-    // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
-        x128 packed_x = load128(x + i * x128::size); // try to keep in cache until next read
-        for(int k = 0; k < packed_x.size; ++k) {
-            if (i*x128::size+k >= V) {  // bounds checking against real V
-                continue;
+    int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x;
+
+    // special-case loop to handle the unaligned elements at the end of the array
+    // this lets us skip the bounds check in the main loop below, which improves performance
+    while ((i+1)*x128::size > V) {
+        for(int k = 0; k < x128::size; ++k) {
+            if (i*x128::size+k >= V) {
+                break; // bounds checking against real V (rather than padded P)
             }
+            float v = (float)x[i*x128::size+k];
+            float old_maxval = thread_maxval;
+            thread_maxval = fmaxf(thread_maxval, v);
+            thread_sumval *= expf((old_maxval - thread_maxval));
+            thread_sumval += expf(v - thread_maxval);
+        }
+        i -= blockDim.x;
+    }
+
+    // main loop for the bulk of the iterations (no bounds checking required!)
+    for (; i >= 0; i -= blockDim.x) {
+        x128 packed_x = load128(x + i * x128::size); // load and keep in cache until fused_classifier loop
+        for(int k = 0; k < x128::size; ++k) {
             float v = (float)packed_x[k];
             float old_maxval = thread_maxval;
             thread_maxval = fmaxf(thread_maxval, v);
@@ -1081,6 +1095,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
             thread_sumval += expf(v - thread_maxval);
         }
     }
+
     // Block Max Reduction -> Maths -> Block Sum Reduction
     float block_maxval = blockReduce<warpReduceMax>(thread_maxval);
     thread_sumval *= expf(thread_maxval - block_maxval);
