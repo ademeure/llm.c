@@ -1090,12 +1090,19 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
     return SoftmaxParams{1.f / block_sumval, block_maxval};
 }
 
+// try to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
+#if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
+#define MAX_FUSED_CLASSIFIER_BLOCKS 2
+#else
+#define MAX_FUSED_CLASSIFIER_BLOCKS 1
+#endif
+
 // same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
 // will _update_ logits to logit gradients
-__global__ void __maxnreg__(32) fused_classifier_kernel3(
-                                floatX* logits, floatX* losses, floatX* probs,
-                                const floatX* dlosses, const int* targets,
-                                int B, int T, int V, int P) {
+__global__ void __launch_bounds__(1024, MAX_FUSED_CLASSIFIER_BLOCKS)
+                fused_classifier_kernel3(floatX* logits, floatX* losses, floatX* probs,
+                                         const floatX* dlosses, const int* targets,
+                                         int B, int T, int V, int P) {
     int idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
     int ix = targets[idx];
 
