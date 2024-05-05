@@ -77,11 +77,11 @@ print("Kernel calls:")
 for rid, row in kernel_profile_data:
     if rid == 0:
         #  headings
-        print(f"id pass    {'name':<40} {'time':>8} {'RAM rd':>8} {'RAM wt':>8} {'L2 rd':>8} {'L2 wt':>8} {'inst':>8}")
+        print(  f"id pass    {'name':<40} {'time':>8} {'RAM BW':>8} {'RAM rd':>8} {'RAM wt':>8} {'L2 rd':>8} {'L2 wt':>8} {'inst':>8}")
         continue
     if rid == 1:
         # units
-        units = f"           {'':<40} {'ms':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'MInst':>8}"
+        units = f"           {'':<40} {'ms':>8} {'GB/s':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'MInst':>8}"
         print(units)
         print("." * len(units))
         continue
@@ -96,6 +96,7 @@ for rid, row in kernel_profile_data:
     l2_read = float(row[14])
     l2_write = float(row[15])
     inst = float(row[16]) / 1e6
+    dram_bw = (read + write) / (time / 1000.0)
 
     kid = rid - 2
 
@@ -161,11 +162,12 @@ for rid, row in kernel_profile_data:
         total['inst'] += inst
 
     pass_info = f"{pass_name}×{multiplier}"
-    print(f"{kid:02} {pass_info:7} {fn_name:<40} {time:8.2f} {read:8.2f} {write:8.2f} {l2_read:8.2f} {l2_write:8.2f} {inst:8.2f}")
+    print(f"{kid:02} {pass_info:7} {fn_name:<40} {time:8.2f} {dram_bw:8.1f} {read:8.2f} {write:8.2f} {l2_read:8.2f} {l2_write:8.2f} {inst:8.2f}")
 
 total_time = total['time']
+total_dram_bw = (total['read'] + total['write']) / (total_time / 1000.0)
 print("." * len(units))
-print(f"           {'Total':<40} {total['time']:8.2f} {total['read']:8.2f} {total['write']:8.2f} {total['l2_read']:8.2f} {total['l2_write']:8.2f} {total['inst']:8.2f}")
+print(f"           {'Total':<40} {total['time']:8.2f} {total_dram_bw:8.1f} {total['read']:8.2f} {total['write']:8.2f} {total['l2_read']:8.2f} {total['l2_write']:8.2f} {total['inst']:8.2f}")
 
 print()
 print("Kernel type summaries:")
