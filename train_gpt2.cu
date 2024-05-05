@@ -936,10 +936,6 @@ __global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX
                 float dout_i = (float)__ldcs(&dout_bt[i]);
                 float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
                 float dnorm_i = (float)weight[i] * dout_i;
-                // gradient contribution to bias
-                atomicAdd(&dbias_shared[i], dout_i);
-                // gradient contribution to weight
-                atomicAdd(&dweight_shared[i], norm_bti * dout_i);
                 // gradient contribution to input
                 float dval = 0.0f;
                 dval += dnorm_i; // term 1
@@ -947,6 +943,10 @@ __global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX
                 dval -= norm_bti * dnorm_norm_mean; // term 3
                 dval *= rstd_bt; // final scale
                 __stcs(&dinp_bt[i], (floatX)((float)dinp_bt[i] + dval));
+                // gradient contribution to bias
+                atomicAdd(&dbias_shared[i], dout_i);
+                // gradient contribution to weight
+                atomicAdd(&dweight_shared[i], norm_bti * dout_i);
             }
         }
     }
