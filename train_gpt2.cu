@@ -872,7 +872,7 @@ __global__ void matmul_backward_bias_kernel6(float* dbias, const floatX* dout, i
     }
 }
 
-__global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+__global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C) {
     extern __shared__ float shared[]; // size = 2 * C + 1
@@ -1451,7 +1451,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
 
     cudaMemsetAsync(scratch, 0, (2 * C + 1) * sizeof(float), main_stream);
 
-    layernorm_backward_kernel7<<<grid_size, block_size, shared_mem_size, main_stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
+    layernorm_backward_kernel8<<<grid_size, block_size, shared_mem_size, main_stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
