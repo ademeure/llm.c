@@ -912,14 +912,13 @@ __global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX
             x128 dout128_i   = load128(dout_bt + i);
             x128 inp128_i    = load128(inp_bt + i);
             x128 weight128_i = load128(weight + i);
-            x128 dinp128_i   = load128(dinp_bt + i);
             for (int k = 0; k < x128::size; k++) {
                 float norm_bti = ((float)inp128_i[k] - mean_bt) * rstd_bt;
                 float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
                 dnorm_mean += dnorm_i;
                 dnorm_norm_mean += dnorm_i * norm_bti;
                 // This is just a silly hack to prefetch dinp128 before the previous loop
-                dnorm_mean += ((float)dinp128_i[k] == INFINITY) ? INFINITY : 0.0f;
+                //dnorm_mean += ((float)dinp128_i[k] == INFINITY) ? INFINITY : 0.0f;
             }
         }
         dnorm_mean = warpReduceSum(dnorm_mean);
@@ -936,6 +935,10 @@ __global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX
                 float dout_i = (float)__ldcs(&dout_bt[i]);
                 float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
                 float dnorm_i = (float)weight[i] * dout_i;
+                // gradient contribution to bias
+                atomicAdd(&dbias_shared[i], dout_i);
+                // gradient contribution to weight
+                atomicAdd(&dweight_shared[i], norm_bti * dout_i);
                 // gradient contribution to input
                 float dval = 0.0f;
                 dval += dnorm_i; // term 1
@@ -943,10 +946,6 @@ __global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX
                 dval -= norm_bti * dnorm_norm_mean; // term 3
                 dval *= rstd_bt; // final scale
                 __stcs(&dinp_bt[i], (floatX)((float)dinp_bt[i] + dval));
-                // gradient contribution to bias
-                atomicAdd(&dbias_shared[i], dout_i);
-                // gradient contribution to weight
-                atomicAdd(&dweight_shared[i], norm_bti * dout_i);
             }
         }
     }
