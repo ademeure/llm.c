@@ -912,13 +912,15 @@ __global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX
             x128 dout128_i   = load128(dout_bt + i);
             x128 inp128_i    = load128(inp_bt + i);
             x128 weight128_i = load128(weight + i);
+            x128 dinp128_i   = load128(dinp_bt + i);
             for (int k = 0; k < x128::size; k++) {
                 float norm_bti = ((float)inp128_i[k] - mean_bt) * rstd_bt;
                 float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
                 dnorm_mean += dnorm_i;
                 dnorm_norm_mean += dnorm_i * norm_bti;
-                // This is just a silly hack to prefetch dinp128 before the previous loop
-                //dnorm_mean += ((float)dinp128_i[k] == INFINITY) ? INFINITY : 0.0f;
+                // This is just a hack to prefetch dinp128 before the previous loop
+                // dinp should never be INF, and if it is, we're screwed anyway
+                dnorm_mean += ((float)dinp128_i[k] == INFINITY) ? INFINITY : 0.0f;
             }
         }
         dnorm_mean = warpReduceSum(dnorm_mean);
@@ -929,6 +931,7 @@ __global__ void layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX
         // now iterate again and accumulate all the gradients
         // unfortunately this loop cannot easily use x128 because of the shared memory atomics
         // because atomics are 32-bit, this would be an 8-way bank conflict, and kill performance
+        // but by prefetching via x128 in the previous loop including dinp, we hit in L1/L2 caches
         for (int n = warpThreadIdx; n < C; n += warpSize * 4) {
             #pragma unroll 4
             for (int i = n, x = 0; x < 4; i += warpSize, x++) {
@@ -1062,7 +1065,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
     const floatX* x = inp + idx * P;
     float thread_maxval = -INFINITY;
     float thread_sumval = 0.0f;
-    /*
+
     // do the loop in reverse to maximise probability of L2 cache hits
     // so even small L2s get some hits on the 2nd read of the same thread
     for (int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x; i >= 0; i -= blockDim.x) {
@@ -1078,39 +1081,6 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
             thread_sumval += expf(v - thread_maxval);
         }
     }
-    */
-
-    int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x;
-
-    // bounds checking against real V (rather than padded P)
-    // handle the the unaligned elements at the end of the array here
-    // this lets us skip the bounds check in the main loop below, which improves performance
-    while ((i+1)*x128::size > V) {
-        for(int k = 0; k < x128::size; ++k) {
-            if (i*x128::size+k >= V) {
-                break;
-            }
-            float v = (float)x[i*x128::size+k];
-            float old_maxval = thread_maxval;
-            thread_maxval = fmaxf(thread_maxval, v);
-            thread_sumval *= expf((old_maxval - thread_maxval));
-            thread_sumval += expf(v - thread_maxval);
-        }
-        i -= blockDim.x;
-    }
-
-    // main loop for the bulk of the iterations (no bounds checking required)
-    for (; i >= 0; i -= blockDim.x) {
-        x128 packed_x = load128(x + i * x128::size); // load and keep in cache until fused_classifier loop
-        for(int k = 0; k < x128::size; ++k) {
-            float v = (float)packed_x[k];
-            float old_maxval = thread_maxval;
-            thread_maxval = fmaxf(thread_maxval, v);
-            thread_sumval *= expf((old_maxval - thread_maxval));
-            thread_sumval += expf(v - thread_maxval);
-        }
-    }
-
     // Block Max Reduction -> Maths -> Block Sum Reduction
     float block_maxval = blockReduce<warpReduceMax>(thread_maxval);
     thread_sumval *= expf(thread_maxval - block_maxval);
@@ -1122,10 +1092,10 @@ __device__ SoftmaxParams prepare_softmax_blockwide(int idx, const floatX* inp, i
 
 // same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
 // will _update_ logits to logit gradients
-__global__ void __launch_bounds__(1024, 2)
-                fused_classifier_kernel3(floatX* logits, floatX* losses, floatX* probs,
-                                         const floatX* dlosses, const int* targets,
-                                         int B, int T, int V, int P) {
+__global__ void __maxnreg__(32) fused_classifier_kernel3(
+                                floatX* logits, floatX* losses, floatX* probs,
+                                const floatX* dlosses, const int* targets,
+                                int B, int T, int V, int P) {
     int idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
     int ix = targets[idx];
 
