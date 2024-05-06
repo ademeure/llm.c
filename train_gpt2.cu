@@ -836,7 +836,7 @@ __global__ void gelu_backward_kernel(floatX* dinp, const floatX* inp, const floa
     }
 }
 
-__global__ void matmul_backward_bias_kernel6(float* dbias, const floatX* dout, int B, int T, int OC) {
+__global__ void matmul_backward_bias_kernel7(float* dbias, const floatX* dout, int B, int T, int OC) {
     // note: this kernel reads in floatX, but it writes to float!
     // this is because we're using atomics, which are super slow in < fp32 precision on < H100 GPUs
     // so the trick is do fp32 atomics to a buffer, and then copy_and_cast the result to floatX
@@ -868,21 +868,26 @@ __global__ void matmul_backward_bias_kernel6(float* dbias, const floatX* dout, i
     for (int i = blockIdx.y*block_size_y + threadIdx.y; i < B * T; i += gridDim.y*block_size_y) {
         x128 packed_dout = load128(dout + global_oc + i*OC);
         for (int k = 0; k < x128::size; k++) {
-            //printf("%d: %f + %f\n", oc, accumulators[k], (float)packed_dout[k]);
             accumulators[k] += (float)packed_dout[k];
         }
-        //__syncthreads(); // keep block synchronised to maximise memory locality (?)
     }
+    // we need to avoid shared memory bank conflicts for the atomicAdd to maximise performance
+    // so we accumulate in a conflict-free order, then reorder to match the global memory order
     for (int k = 0; k < x128::size; k++) {
-        atomicAdd(shared + local_oc + k, accumulators[k]);
+        atomicAdd(shared + threadIdx.x + (k * block_size_x), accumulators[k]);
     }
+    if (threadIdx.y >= x128::size) { return; } // only need this many warps to reorder the data
     __syncthreads();
-    if (threadIdx.y == 0) {
-        for (int i = threadIdx.x; i < OC_per_warp; i += block_size_x) {
-            //printf("%d => %f\n", i, shared[i]);
-            atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
-        }
-    }
+    // read the accumulated values in the conflict-free order
+    int i = threadIdx.x + (threadIdx.y * block_size_x);
+    float tmp = shared[i];
+    __syncthreads();
+    // write them back to shared memory in the global memory order
+    // 8-way bank conflict for BF16 x128, but only 8x per threadblock (rather than 8x per warp)
+    shared[local_oc + threadIdx.y] = tmp;
+    __syncthreads();
+    // now we do a perfectly coalesced atomic add to global memory (1x 128-byte cacheline per warp)
+    atomicAdd(dbias + i + blockIdx.x*OC_per_warp, shared[i]);
 }
 
 __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
@@ -985,7 +990,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        *tmp_flag = atomicAdd(scratchFlag, 1);
+        *tmp_flag = atomicInc(scratchFlag, gridDim.x);
     }
     __syncthreads();
     if (*tmp_flag == gridDim.x-1) {
@@ -1436,9 +1441,10 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
         const int grid_size_y = max(1, cuda_threads_per_SM * cuda_num_SMs / (block_size * grid_size_x)); // full GPU!
 
         assert((OC % OC_per_warp) == 0); // there is no bounds checking in the kernel to maximise performance
+        assert(block_size_y >= x128::size); // part of the kernel assumes this is large enough to avoid loops
 
         cudaMemsetAsync(dbias_buffer, 0, OC * sizeof(float), main_stream);
-        matmul_backward_bias_kernel6<<<dim3(grid_size_x, grid_size_y),
+        matmul_backward_bias_kernel7<<<dim3(grid_size_x, grid_size_y),
                                        dim3(block_size_x, block_size_y),
                                        OC_per_warp * sizeof(float), main_stream>>>(dbias_buffer, dout, B, T, OC);
         cast_and_add_kernel<<<CEIL_DIV(OC, 256), 256, 0, main_stream>>>(dbias, dbias_buffer, OC);
@@ -2478,11 +2484,11 @@ int main(int argc, char *argv[]) {
     cuda_arch_major = deviceProp.major;
     cuda_arch_minor = deviceProp.minor;
 
-    cudaCheck(cudaStreamCreate(&main_stream));
+    main_stream = 0;
     cudaEventCreateWithFlags(&main_event, cudaEventDisableTiming);
     cudaEventCreateWithFlags(&loss_event, cudaEventDisableTiming);
     for (int i = 0; i < num_parallel_streams; i++) {
-        cudaCheck(cudaStreamCreate(&parallel_streams[i]));
+        parallel_streams[i] = 0;
         cudaEventCreateWithFlags(&parallel_events[i], cudaEventDisableTiming);
     }
 
