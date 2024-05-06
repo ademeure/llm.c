@@ -1163,7 +1163,17 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     floatX* logits_vec = logits + idx * P;
 
     int i = threadIdx.x;
-    if (probs != NULL) { // for debugging and inference only
+    if (probs == NULL) { // usual path
+        for (; i < V/x128::size; i += blockDim.x) {
+            x128 packed_logits_vec = load128(logits_vec + i * x128::size); // cs via store128cs below
+            for(int k = 0; k < x128::size; ++k) {
+                float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
+                float indicator = (k+i*x128::size == ix) ? 1.0f : 0.0f;
+                packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
+            }
+            store128cs(logits_vec + i * x128::size, packed_logits_vec);
+        }
+    } else { // for debugging and inference only
         for (; i < V/x128::size; i += blockDim.x) {
             // this is the 2nd read of logits after the one in prepare_softmax2
             // this data will never be needed again, so we reduce cache persistence
@@ -1177,16 +1187,6 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
             }
             store128cs(logits_vec + i * x128::size, packed_logits_vec);
             store128cs(probs + idx * P + i * x128::size, packed_probs);
-        }
-    } else { // usual path
-        for (; i < V/x128::size; i += blockDim.x) {
-            x128 packed_logits_vec = load128(logits_vec + i * x128::size); // cs via store128cs below
-            for(int k = 0; k < x128::size; ++k) {
-                float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
-                float indicator = (k+i*x128::size == ix) ? 1.0f : 0.0f;
-                packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
-            }
-            store128cs(logits_vec + i * x128::size, packed_logits_vec);
         }
     }
     // handle remaining elements after the last multiple of x128::size
