@@ -1160,28 +1160,36 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     float dloss = (dlosses != NULL) ? (float)dlosses[idx] : 1.0f / (B*T);
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
-    const floatX* logits_vec = logits + idx * P;
+    floatX* logits_vec = logits + idx * P;
 
     int i = threadIdx.x;
-    for (; i < V/x128::size; i += blockDim.x) {
-        // this is the 2nd read of logits after the one in prepare_softmax2
-        // this data will never be needed again, so we reduce cache persistence
-        x128 packed_logits_vec = load128(logits_vec + i * x128::size); // cs via store128cs below
-        x128 packed_probs;
-        x128 packed_logits;
-        for(int k = 0; k < packed_logits_vec.size; ++k) {
-            int element = i*packed_logits_vec.size + k;
-            float v = (float)packed_logits_vec[k];
-            float prob = expf(v - sp.Offset) * sp.Scale;
-            packed_probs[k] = (floatX)prob;
-            float indicator = (element == ix) ? 1.0f : 0.0f;
-            packed_logits[k] = (floatX)((prob - indicator) * dloss);
+    if (probs != NULL) { // for debugging and inference only
+        for (; i < V/x128::size; i += blockDim.x) {
+            // this is the 2nd read of logits after the one in prepare_softmax2
+            // this data will never be needed again, so we reduce cache persistence
+            x128 packed_logits_vec = load128(logits_vec + i * x128::size); // cs via store128cs below
+            x128 packed_probs;
+            for(int k = 0; k < x128::size; ++k) {
+                float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
+                packed_probs[k] = (floatX)prob;
+                float indicator = (k+i*x128::size == ix) ? 1.0f : 0.0f;
+                packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
+            }
+            store128cs(logits_vec + i * x128::size, packed_logits_vec);
+            store128cs(probs + idx * P + i * x128::size, packed_probs);
         }
-        store128cs(logits + idx * P + i * packed_logits_vec.size, packed_logits);
-        if (probs != NULL) {
-            store128cs(probs + idx * P + i * packed_logits_vec.size, packed_probs);
+    } else { // usual path
+        for (; i < V/x128::size; i += blockDim.x) {
+            x128 packed_logits_vec = load128(logits_vec + i * x128::size); // cs via store128cs below
+            for(int k = 0; k < x128::size; ++k) {
+                float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
+                float indicator = (k+i*x128::size == ix) ? 1.0f : 0.0f;
+                packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
+            }
+            store128cs(logits_vec + i * x128::size, packed_logits_vec);
         }
     }
+    // handle remaining elements after the last multiple of x128::size
     i *= x128::size;
     for (; i < V; i += blockDim.x) {
         float v = (float)logits_vec[i];
