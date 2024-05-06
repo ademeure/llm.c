@@ -1161,7 +1161,9 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const floatX* logits_vec = logits + idx * P;
-    for (int i = threadIdx.x; i < (V+x128::size-1)/x128::size; i += blockDim.x) {
+
+    int i = threadIdx.x;
+    for (; i < V/x128::size; i += blockDim.x) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // this data will never be needed again, so we reduce cache persistence
         x128 packed_logits_vec = load128(logits_vec + i * x128::size); // cs via store128cs below
@@ -1169,20 +1171,26 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
         x128 packed_logits;
         for(int k = 0; k < packed_logits_vec.size; ++k) {
             int element = i*packed_logits_vec.size + k;
-            //if (element >= V) {  // bounds checking against real V
-            //    continue;
-            //}
             float v = (float)packed_logits_vec[k];
             float prob = expf(v - sp.Offset) * sp.Scale;
             packed_probs[k] = (floatX)prob;
             float indicator = (element == ix) ? 1.0f : 0.0f;
             packed_logits[k] = (floatX)((prob - indicator) * dloss);
         }
-        //if (logits != NULL){
-            store128cs(logits + idx * P + i * packed_logits_vec.size, packed_logits);
-        //}
+        store128cs(logits + idx * P + i * packed_logits_vec.size, packed_logits);
         if (probs != NULL) {
             store128cs(probs + idx * P + i * packed_logits_vec.size, packed_probs);
+        }
+    }
+    i *= x128::size;
+    for (; i < V; i += blockDim.x) {
+        float v = (float)logits_vec[i];
+        float prob = expf(v - sp.Offset) * sp.Scale;
+        float indicator = (i == ix) ? 1.0f : 0.0f;
+        float dlogit = (prob - indicator) * dloss;
+        __stcs(logits + idx * P + i, (floatX)dlogit);
+        if (probs != NULL) {
+            probs[idx * P + i] = (floatX)prob;
         }
     }
 }
