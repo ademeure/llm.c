@@ -6,6 +6,7 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
     // a is the calculated tensor, b is the reference tensor
     int print_upto = 10;
     int ok = 1;
+    int max_diff_id = 0;
     float max_diff = 0.0f;
     float max_rel_error = 0.0f;
     float max_a = 0.0f;
@@ -15,6 +16,7 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
         float diff = fabsf(a[i] - b[i]);
         if (diff > max_diff) {
             max_diff = diff;
+            max_diff_id = i;
             float denom = fabsf(b[i]);
             max_rel_error = (denom == 0.0f) ? 0.0f : diff / denom;
             max_a = a[i];
@@ -30,11 +32,11 @@ int check_tensor(float *a, float *b, int n, const char* label, float threshold=1
     }
     // print the final result
     if (ok) {
-        printf("TENSOR OK, max diff: %e, with rel error: %e (calculated=%f, ref=%f)\n",
-                max_diff, max_rel_error, max_a, max_b);
+        printf("TENSOR OK, max diff: %e, with rel error: %e (calculated=%f, ref=%f) [id: %d/%d]\n",
+                max_diff, max_rel_error, max_a, max_b, max_diff_id, n);
     } else {
-        printf("TENSOR NOT OK, max diff: %e, with rel error: %e (calculated=%f, ref=%f)\n",
-                max_diff, max_rel_error, max_a, max_b);
+        printf("TENSOR NOT OK, max diff: %e, with rel error: %e (calculated=%f, ref=%f) [id: %d/%d]\n",
+                max_diff, max_rel_error, max_a, max_b, max_diff_id, n);
     }
     return ok;
 }
@@ -194,7 +196,7 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &start);
         gpt2_forward(&model, x, y, B, T);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model);
+        gpt2_backward(&model, x);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
 
