@@ -1216,118 +1216,54 @@ void encoder_forward(floatX* out,
     cudaCheck(cudaGetLastError());
 }
 
-__global__ void processBuckets_kernel1(int* bucket_starts, int* bucket_sizes, int* workload_indices,
-                               floatX* dwte, const floatX* dout, const int* inp, unsigned int seed,
-                               int B, int T, int C) {
-    int smIndex = blockIdx.x;
-    int startIdx = bucket_starts[smIndex];
-    int size = bucket_sizes[smIndex];
-    int c_per_warp = 32 * x128::size;
-
-    int last_ix = -1;
-    int last_c_id = -1;
-    float tmp_dwte[x128::size];
-    x128 packed_out;
-
-    for (int i = startIdx; i < startIdx + size; ++i) {
-        int idx = workload_indices[i];
-        int c_id = idx / (1024*1024);
-
-        int bt = idx & (1024*1024-1);
-        int b = bt / T;
-        int t = bt % T;
-
-        int ix = inp[b * T + t];
-        const floatX* dout_btc = dout + b * T * C + t * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
-
-        if (last_ix != ix || last_c_id != c_id) {
-            floatX* dwte_ix = dwte + ix * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
-            x128 packed_inp1 = load128cs(dout_btc);
-            x128 packed_inp2 = load128(dwte_ix);
-
-            if (last_ix != -1) {
-                // write previous
-                floatX* dwte_last_ix = dwte + last_ix * C + (last_c_id * c_per_warp) + (threadIdx.x * x128::size);
-                for (int k = 0; k < packed_out.size; k++) {
-                    stochastic_rounding(tmp_dwte[k], &packed_out[k], seed);
-                }
-                store128(dwte_last_ix, packed_out);
-            }
-
-            for (int k = 0; k < packed_inp1.size; k++) {
-                tmp_dwte[k] = (float)packed_inp1[k] + (float)packed_inp2[k];
-            }
-        } else {
-            x128 packed_inp1 = load128cs(dout_btc);
-            for (int k = 0; k < packed_inp1.size; k++) {
-                tmp_dwte[k] += (float)packed_inp1[k];
-            }
-        }
-        last_ix = ix;
-        last_c_id = c_id;
-    }
-
-    if (last_ix != -1) {
-        floatX* dwte_last_ix = dwte + last_ix * C +  (last_c_id * c_per_warp) + (threadIdx.x * x128::size);
-        for (int k = 0; k < packed_out.size; k++) {
-            stochastic_rounding(tmp_dwte[k], &packed_out[k], seed + k);
-        }
-        store128(dwte_last_ix, packed_out);
-    }
-}
-
-// templated for block size
 template <int BLOCK_SIZE=256>
-__global__ void wte_backward_kernel(int* bucket_starts, int* bucket_sizes, uint64_t* workload_indices,
-                               floatX* dwte, const floatX* dout, const int* inp, unsigned int seed,
-                               int B, int T, int C) {
+__global__ void wte_backward_kernel(int* bucket_starts, int* bucket_sizes, int* d_bucket_ix, int* d_bucket_c,
+                                    int* workload_indices, floatX* dwte, const floatX* dout, const int* inp,
+                                    unsigned int seed, int B, int T, int C) {
     int bucket = blockIdx.x;
     int item = threadIdx.x / 32;
-    int startIdx = bucket_starts[bucket];
-    int size = bucket_sizes[bucket];
-
-    float tmp_dwte[x128::size];
+    int warp_id = threadIdx.x / 32;
     int c_per_warp = 32 * x128::size;
-    int ix = -1;
-    int c_id;
 
-    for (int k = 0; k < x128::size; k++) {
-        tmp_dwte[k] = 0.0f;
-    }
+    int start_idx = bucket_starts[bucket];
+    int size = bucket_sizes[bucket];
+    int ix = d_bucket_ix[bucket];
+    int c = d_bucket_c[bucket] * c_per_warp;
+
+    float accum[x128::size] = {0.0f};
 
     for(; item < size; item += BLOCK_SIZE/32) {
-        uint64_t idx = workload_indices[startIdx + item];
-        ix = (idx >> 30) & (1024*1024-1); // todo: should be per-bucket, not per-item
-        c_id = (idx >> 20) & 1023; // todo: per-bucket
-        int bt = idx & (1024*1024-1);
+        int bt = workload_indices[start_idx + item];
         int b = bt / T;
         int t = bt % T;
 
-        const floatX* dout_btc = dout + b * T * C + t * C + (c_id * c_per_warp) + ((threadIdx.x & 31) * x128::size);
+        const floatX* dout_btc = dout + b * T * C + t * C + c + ((threadIdx.x & 31) * x128::size);
         x128 packed_inp1 = load128cs(dout_btc);
         for (int k = 0; k < packed_inp1.size; k++) {
-            tmp_dwte[k] += (float)packed_inp1[k];
+            accum[k] += (float)packed_inp1[k];
         }
     }
+
     if (size > 1) {
-        __shared__ float tmp_dwte_shared[x128::size * BLOCK_SIZE];
+        __shared__ float accum_shared[x128::size * BLOCK_SIZE];
         for (int k = 0; k < x128::size; k++) {
-            tmp_dwte_shared[threadIdx.x + k * BLOCK_SIZE] = tmp_dwte[k];
+            accum_shared[threadIdx.x + k * BLOCK_SIZE] = accum[k];
         }
         __syncthreads();
-        if (threadIdx.x < 32) {
-            for (int i = threadIdx.x+32; i < BLOCK_SIZE; i += 32) {
+        if (warp_id == 0) {
+            for (int i = threadIdx.x+32; i < min(BLOCK_SIZE, size*32); i += 32) {
                 for (int k = 0; k < x128::size; k++) {
-                    tmp_dwte[k] += tmp_dwte_shared[i + k * BLOCK_SIZE];
+                    accum[k] += accum_shared[i + k * BLOCK_SIZE];
                 }
             }
         }
     }
-    if (threadIdx.x < 32) {
-        floatX* dwte_ix = dwte + ix * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
+
+    if (warp_id == 0) {
+        floatX* dwte_ix = dwte + ix * C + c + (threadIdx.x * x128::size);
         x128 packed_in_out = load128(dwte_ix);
         for (int k = 0; k < x128::size; k++) {
-            stochastic_rounding(tmp_dwte[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
+            stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
         }
         store128(dwte_ix, packed_in_out);
     }
@@ -1363,7 +1299,6 @@ __global__ void wpe_backward_kernel(floatX* dwte, floatX* dwpe,
 void encoder_backward(floatX* dwte, floatX* dwpe,
                     const floatX* dout, const int* inp, const int* inputs_cpu,
                     int B, int T, int C, unsigned int seed) {
-    int num_SMs = deviceProp.multiProcessorCount;
     int num_channels_per_warp = 32 * x128::size;
     int num_warps_per_token = C / num_channels_per_warp;
     assert((C % num_channels_per_warp) == 0);
@@ -1371,9 +1306,9 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
     // Step 1: Sort inputs into buckets
     int total_items = 0;
     std::unordered_map<uint64_t, std::vector<uint64_t>> buckets;
-    for (int i = 0; i < B * T; i++) {
-        for (int j = 0; j < num_warps_per_token; j++) {
-            uint64_t data = i + (j<<20ULL) + ((uint64_t)inputs_cpu[i]<<30ULL);
+    for (uint64_t i = 0; i < B * T; i++) {
+        for (uint64_t j = 0; j < num_warps_per_token; j++) {
+            uint64_t data = i + (j<<32ULL) + ((uint64_t)inputs_cpu[i]<<42ULL);
             buckets[j + num_warps_per_token*inputs_cpu[i]].push_back(data);
             total_items++;
         }
@@ -1388,35 +1323,47 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
 
     // get number of buckets
     int num_buckets = buckets.size();
+    int* workload_indices = new int[total_items];
     int* bucket_starts = new int[num_buckets];
     int* bucket_sizes = new int[num_buckets];
-    uint64_t* workload_indices = new uint64_t[total_items];
+    int* bucket_ix = new int[num_buckets];
+    int* bucket_c = new int[num_buckets];
 
     int bucket_index = 0;
     int workload_index = 0;
     for (const auto& bucket : sortedBuckets) {
         bucket_starts[bucket_index] = workload_index;
-        bucket_sizes[bucket_index++] = bucket.second.size();
+        bucket_sizes[bucket_index] = bucket.second.size();
+        bucket_ix[bucket_index] = (bucket.second[0] >> 42ULL) & ((1ULL<<20ULL)-1ULL);
+        bucket_c[bucket_index] =  (bucket.second[0] >> 32ULL) & ((1ULL<<10ULL)-1ULL);
         for (uint64_t idx : bucket.second) {
-            workload_indices[workload_index++] = idx;
+            workload_indices[workload_index++] = (int)(idx & ((1ULL<<31ULL)-1ULL));
         }
+        bucket_index++;
     }
 
+    // TODO: use scratch buffer and make sure it's big enough for the following:
+    //int worst_case_bucket_size = V * C / (32 * x128::size);
+    //int worst_case_indices_size = B * T;
+
     // Allocate memory on the device
-    int *d_bucket_starts, *d_bucket_sizes;
-    uint64_t *d_workload_indices;
+    int *d_bucket_starts, *d_bucket_sizes, *d_bucket_ix, *d_bucket_c, *d_workload_indices;
     cudaMalloc(&d_bucket_starts, num_buckets * sizeof(int));
     cudaMalloc(&d_bucket_sizes, num_buckets * sizeof(int));
-    cudaMalloc(&d_workload_indices, total_items * sizeof(uint64_t));
+    cudaMalloc(&d_bucket_ix, num_buckets * sizeof(int));
+    cudaMalloc(&d_bucket_c, num_buckets * sizeof(int));
+    cudaMalloc(&d_workload_indices, total_items * sizeof(int));
 
     // Copy data from host to device
     cudaMemcpy(d_bucket_starts, bucket_starts, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_bucket_sizes, bucket_sizes, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_workload_indices, workload_indices, total_items * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bucket_ix, bucket_ix, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bucket_c, bucket_c, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice);
 
     // Launch kernels
     NVTX_RANGE_FN();
-    wte_backward_kernel<<<num_buckets, 256>>>(d_bucket_starts, d_bucket_sizes, d_workload_indices, dwte, dout, inp, seed, B, T, C);
+    wte_backward_kernel<256><<<num_buckets, 256>>>(d_bucket_starts, d_bucket_sizes, d_bucket_ix, d_bucket_c, d_workload_indices, dwte, dout, inp, seed, B, T, C);
 
     const int N = T * C;
     const int block_size = 256;
