@@ -1379,23 +1379,31 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
                     int B, int T, int C, unsigned int seed) {
     NVTX_RANGE_FN();
 
-    // Launch wpe kernel (so we have as many things running in parallel on GPU before the CPU work)
-    const int N = T * C;
+    int num_channels_per_warp = 32 * x128::size;
+    int C_groups = C / num_channels_per_warp;
+    assert((C % num_channels_per_warp) == 0);
+
+    // TODO: HACK: only do this once outside this function
+    static bool first = true;
+    static int* workload_indices = new int[B*T*C_groups];
+    static int* bucket_starts = new int[B*T*C_groups];
+    static int* bucket_sizes = new int[B*T*C_groups];
+    static int* bucket_ix = new int[B*T*C_groups];
+    static int* bucket_c = new int[B*T*C_groups];
+
+    // Launch wpe kernel (so we have more things running in parallel on GPU before the CPU work)
+    const int N = T * C / x128::size;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
     wpe_backward_kernel<<<grid_size, block_size, 0>>>(dwte, dwpe, dout, inp, B, T, C, seed);
-
-    int num_channels_per_warp = 32 * x128::size;
-    int num_warps_per_token = C / num_channels_per_warp;
-    assert((C % num_channels_per_warp) == 0);
 
     // Step 1: Sort inputs into buckets
     int total_items = 0;
     std::unordered_map<uint64_t, std::vector<uint64_t>> buckets;
     for (uint64_t i = 0; i < B * T; i++) {
-        for (uint64_t j = 0; j < num_warps_per_token; j++) {
+        for (uint64_t j = 0; j < C_groups; j++) {
             uint64_t data = i + (j<<32ULL) + ((uint64_t)inputs_cpu[i]<<42ULL);
-            buckets[j + num_warps_per_token*inputs_cpu[i]].push_back(data);
+            buckets[j + C_groups * inputs_cpu[i]].push_back(data);
             total_items++;
         }
     }
@@ -1408,13 +1416,6 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
               });
 
     int num_buckets = buckets.size();
-    // TODO: HACK: only do this once outside this function
-    int* workload_indices = new int[total_items];
-    int* bucket_starts = new int[num_buckets];
-    int* bucket_sizes = new int[num_buckets];
-    int* bucket_ix = new int[num_buckets];
-    int* bucket_c = new int[num_buckets];
-
     int bucket_index = 0;
     int workload_index = 0;
     for (const auto& bucket : sortedBuckets) {
@@ -1430,13 +1431,12 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
 
     // TODO: HACK: reuse scratch buffer of main allocation, do not allocate here!
     // Allocate memory on the device
-    static bool first = true;
     static int *d_bucket_starts, *d_bucket_sizes, *d_bucket_ix, *d_bucket_c, *d_workload_indices;
     if (first) {
-        cudaMalloc(&d_bucket_starts, num_buckets * sizeof(int));
-        cudaMalloc(&d_bucket_sizes, num_buckets * sizeof(int));
-        cudaMalloc(&d_bucket_ix, num_buckets * sizeof(int));
-        cudaMalloc(&d_bucket_c, num_buckets * sizeof(int));
+        cudaMalloc(&d_bucket_starts, B*T*C_groups * sizeof(int));
+        cudaMalloc(&d_bucket_sizes, B*T*C_groups * sizeof(int));
+        cudaMalloc(&d_bucket_ix, B*T*C_groups * sizeof(int));
+        cudaMalloc(&d_bucket_c, B*T*C_groups * sizeof(int));
         cudaMalloc(&d_workload_indices, total_items * sizeof(int));
         first = false;
     }
@@ -1452,13 +1452,6 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
     // Launch wte kernel
     wte_backward_kernel<256><<<num_buckets, 256>>>(d_bucket_starts, d_bucket_sizes, d_bucket_ix, d_bucket_c, d_workload_indices, dwte, dout, inp, seed, B, T, C);
     cudaCheck(cudaGetLastError());
-
-    // TODO: HACK: only do this once outside this function
-    delete [] workload_indices;
-    delete [] bucket_starts;
-    delete [] bucket_sizes;
-    delete [] bucket_ix;
-    delete [] bucket_c;
 }
 
 void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
