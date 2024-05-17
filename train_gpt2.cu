@@ -507,52 +507,6 @@ __global__ void encoder_forward_kernel3(floatX* out,
     store128(out_btc, packed_out);
 }
 
-template <typename T>
-__device__ void atomicStochasticAdd(T* address, float val0, float val1, unsigned int seed) {
-    static_assert(sizeof(T) == 2, "Only 16-bit atomicStochasticAdd supported.");
-    float2 val = make_float2(val0, val1);
-    unsigned int* address_as_uint = (unsigned int*)address;
-    unsigned int old = *address_as_uint, assumed;
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-    do {
-        assumed = old;
-        float2 new_fp32 = make_float2((float)(reinterpret_cast<T*>(&old)[0]) + val.x,
-                                      (float)(reinterpret_cast<T*>(&old)[1]) + val.y);
-        T new_rounded[2];
-        stochastic_rounding(new_fp32.x, &new_rounded[0], random);
-        stochastic_rounding(new_fp32.y, &new_rounded[1], random >> 16);
-        old = atomicCAS(address_as_uint, assumed, *(unsigned int*)&new_rounded);
-    } while (assumed != old);
-}
-__device__ void atomicStochasticAdd(float* address, float val0, float val1, unsigned int seed) {
-    atomicAdd(address, val0);
-    atomicAdd(address + 1, val1);
-}
-
-__global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
-                                        const floatX* dout, const int* inp,
-                                        int B, int T, int C, unsigned int seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C;
-    idx *= 2; // 2 elements per thread
-    if (idx >= N) { return; }
-
-    int bt = idx / C;
-    int b = bt / T;
-    int t = bt % T;
-    int c = idx % C;
-
-    int ix = inp[b * T + t];
-
-    const floatX* dout_btc = dout + b * T * C + t * C + c;
-    floatX* dwte_ix = dwte + ix * C + c;
-    floatX* dwpe_tc = dwpe + t * C + c;
-
-    float2 dout_data = make_float2(dout_btc[0], dout_btc[1]);
-    //atomicStochasticAdd(dwte_ix, dout_data.x, dout_data.y, seed);
-    atomicStochasticAdd(dwpe_tc, dout_data.x, dout_data.y, seed ^ 0xFFFFFFFF);
-}
-
 __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
                                     const floatX* __restrict__ bias, int N, int C) {
@@ -1262,38 +1216,12 @@ void encoder_forward(floatX* out,
     cudaCheck(cudaGetLastError());
 }
 
-
-/*
-__global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
-                                        const floatX* dout, const int* inp,
-                                        int B, int T, int C, unsigned int seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C;
-    idx *= 2; // 2 elements per thread
-    if (idx >= N) { return; }
-
-    int bt = idx / C;
-    int b = bt / T;
-    int t = bt % T;
-    int c = idx % C;
-
-    int ix = inp[b * T + t];
-
-    const floatX* dout_btc = dout + b * T * C + t * C + c;
-    floatX* dwte_ix = dwte + ix * C + c;
-    floatX* dwpe_tc = dwpe + t * C + c;
-
-    float2 dout_data = make_float2(dout_btc[0], dout_btc[1]);
-    //atomicStochasticAdd(dwte_ix, dout_data.x, dout_data.y, seed);
-    atomicStochasticAdd(dwpe_tc, dout_data.x, dout_data.y, seed ^ 0xFFFFFFFF);
-}*/
-
-__global__ void processBuckets_kernel1(int* smBucketStarts, int* smBucketSizes, int* smWorkloadIndices,
+__global__ void processBuckets_kernel1(int* bucket_starts, int* bucket_sizes, int* workload_indices,
                                floatX* dwte, const floatX* dout, const int* inp, unsigned int seed,
                                int B, int T, int C) {
     int smIndex = blockIdx.x;
-    int startIdx = smBucketStarts[smIndex];
-    int size = smBucketSizes[smIndex];
+    int startIdx = bucket_starts[smIndex];
+    int size = bucket_sizes[smIndex];
     int c_per_warp = 32 * x128::size;
 
     int last_ix = -1;
@@ -1302,7 +1230,7 @@ __global__ void processBuckets_kernel1(int* smBucketStarts, int* smBucketSizes, 
     x128 packed_out;
 
     for (int i = startIdx; i < startIdx + size; ++i) {
-        int idx = smWorkloadIndices[i];
+        int idx = workload_indices[i];
         int c_id = idx / (1024*1024);
 
         int bt = idx & (1024*1024-1);
@@ -1342,264 +1270,95 @@ __global__ void processBuckets_kernel1(int* smBucketStarts, int* smBucketSizes, 
     if (last_ix != -1) {
         floatX* dwte_last_ix = dwte + last_ix * C +  (last_c_id * c_per_warp) + (threadIdx.x * x128::size);
         for (int k = 0; k < packed_out.size; k++) {
-            stochastic_rounding(tmp_dwte[k], &packed_out[k], seed);
+            stochastic_rounding(tmp_dwte[k], &packed_out[k], seed + k);
         }
         store128(dwte_last_ix, packed_out);
     }
 }
 
-__global__ void processBuckets2(int* smBucketStarts, int* smBucketSizes, uint64_t* smWorkloadIndices,
+// templated for block size
+template <int BLOCK_SIZE=256>
+__global__ void wte_backward_kernel(int* bucket_starts, int* bucket_sizes, uint64_t* workload_indices,
                                floatX* dwte, const floatX* dout, const int* inp, unsigned int seed,
                                int B, int T, int C) {
-    int smIndex = blockIdx.x;
-    int startIdx = smBucketStarts[smIndex];
-    int size = smBucketSizes[smIndex];
-    int c_per_warp = 32 * x128::size;
+    int bucket = blockIdx.x;
+    int item = threadIdx.x / 32;
+    int startIdx = bucket_starts[bucket];
+    int size = bucket_sizes[bucket];
 
-    int last_ix = -1;
-    int last_c_id = -1;
     float tmp_dwte[x128::size];
-    x128 packed_out;
+    int c_per_warp = 32 * x128::size;
+    int ix = -1;
+    int c_id;
 
-    for (int i = startIdx; i < startIdx + size; i++) {
-        uint64_t idx = smWorkloadIndices[i];
+    for (int k = 0; k < x128::size; k++) {
+        tmp_dwte[k] = 0.0f;
+    }
 
-        uint64_t ix = (idx>>30ULL) & (1024*1024-1);
-        int c_id = (idx>>20ULL) & 1023;
+    for(; item < size; item += BLOCK_SIZE/32) {
+        uint64_t idx = workload_indices[startIdx + item];
+        ix = (idx >> 30) & (1024*1024-1); // todo: should be per-bucket, not per-item
+        c_id = (idx >> 20) & 1023; // todo: per-bucket
         int bt = idx & (1024*1024-1);
         int b = bt / T;
         int t = bt % T;
 
-        //printf("idx: %llu, c_id: %d, ix: %llu, b: %d, t: %d\n", idx, c_id, ix, b, t);
-
-        const floatX* dout_btc = dout + b * T * C + t * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
+        const floatX* dout_btc = dout + b * T * C + t * C + (c_id * c_per_warp) + ((threadIdx.x & 31) * x128::size);
         x128 packed_inp1 = load128cs(dout_btc);
-
-        if (last_ix != ix || last_c_id != c_id) {
-            floatX* dwte_ix = dwte + ix * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
-            x128 packed_inp1 = load128cs(dout_btc);
-            x128 packed_inp2 = load128(dwte_ix);
-
-            if (last_ix != -1) {
-                // write previous
-                floatX* dwte_last_ix = dwte + last_ix * C + (last_c_id * c_per_warp) + (threadIdx.x * x128::size);
-                for (int k = 0; k < packed_out.size; k++) {
-                    stochastic_rounding(tmp_dwte[k], &packed_out[k], seed);
-                }
-                store128(dwte_last_ix, packed_out);
-            }
-
-            for (int k = 0; k < packed_inp1.size; k++) {
-                tmp_dwte[k] = (float)packed_inp1[k] + (float)packed_inp2[k];
-            }
-        } else {
-            x128 packed_inp1 = load128cs(dout_btc);
-            for (int k = 0; k < packed_inp1.size; k++) {
-                tmp_dwte[k] += (float)packed_inp1[k];
-            }
+        for (int k = 0; k < packed_inp1.size; k++) {
+            tmp_dwte[k] += (float)packed_inp1[k];
         }
-        last_ix = ix;
-        last_c_id = c_id;
     }
-
-    if (last_ix != -1) {
-        floatX* dwte_last_ix = dwte + last_ix * C +  (last_c_id * c_per_warp) + (threadIdx.x * x128::size);
-        for (int k = 0; k < packed_out.size; k++) {
-            stochastic_rounding(tmp_dwte[k], &packed_out[k], seed);
+    if (size > 1) {
+        __shared__ float tmp_dwte_shared[x128::size * BLOCK_SIZE];
+        for (int k = 0; k < x128::size; k++) {
+            tmp_dwte_shared[threadIdx.x + k * BLOCK_SIZE] = tmp_dwte[k];
         }
-        store128(dwte_last_ix, packed_out);
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            for (int i = threadIdx.x+32; i < BLOCK_SIZE; i += 32) {
+                for (int k = 0; k < x128::size; k++) {
+                    tmp_dwte[k] += tmp_dwte_shared[i + k * BLOCK_SIZE];
+                }
+            }
+        }
+    }
+    if (threadIdx.x < 32) {
+        floatX* dwte_ix = dwte + ix * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
+        x128 packed_in_out = load128(dwte_ix);
+        for (int k = 0; k < x128::size; k++) {
+            stochastic_rounding(tmp_dwte[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
+        }
+        store128(dwte_ix, packed_in_out);
     }
 }
 
-__global__ void processBuckets(int* smBucketStarts, int* smBucketSizes, uint64_t* smWorkloadIndices,
-                               floatX* dwte, const floatX* dout, const int* inp, unsigned int seed,
-                               int B, int T, int C) {
-    int smIndex = blockIdx.x;
-    int startIdx = smBucketStarts[smIndex];
-    int size = smBucketSizes[smIndex];
-    int c_per_warp = 32 * x128::size;
+__global__ void wpe_backward_kernel(floatX* dwte, floatX* dwpe,
+                                    const floatX* dout, const int* inp,
+                                    int B, int T, int C, unsigned int seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = T * C;
+    idx *= x128::size;
+    if (idx >= N) { return; }
 
-    int last_ix = -1;
-    int last_c_id = -1;
-    float tmp_dwte[x128::size];
-    x128 packed_out;
+    int t = idx / C;
+    int c = idx % C;
+    float accum[x128::size] = {0.0f};
 
-    int threadID = threadIdx.x + threadIdx.y * blockDim.x;
-
-    __shared__ x128 tmp_dwte_shared[1024];
-
-    for (int i = startIdx + threadIdx.y; i < startIdx + size; i += blockDim.y) {
-        bool last_iteration = (i-threadIdx.y+blockDim.y >= startIdx + size);
-        uint64_t idx = smWorkloadIndices[i];
-        uint64_t ix = (idx>>30ULL) & (1024*1024-1);
-
-        int c_id = (idx>>20ULL) & 1023;
-        int bt = idx & (1024*1024-1);
-        int b = bt / T;
-        int t = bt % T;
-
-        const floatX* dout_btc = dout + b * T * C + t * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
-        x128 packed_inp1 = load128cs(dout_btc);
-        __syncthreads();
-
-        uint64_t all_idx = smWorkloadIndices[i-threadIdx.y+threadIdx.x];
-        uint64_t all_ix = (all_idx>>30ULL) & (1024*1024-1);
-        // use __match_any_sync to check if this is the same all_ix as previous threads in the warp
-        int mask = __match_any_sync(0xFFFFFFFF, all_ix);
-        int leader = __ffs(mask) - 1;    // select a leader
-
-        // check if this is the last warp handling this ix
-        // 1) get most significant bit set in mask
-        int last = __clz(mask);
-        int first = __ffs(mask) - 1;
-        int num_active = __popc(mask); // todo don't need popc
-        if (last != 0 || last_iteration) {
-            if (threadIdx.y != first) {
-                // write to shared memory
-                tmp_dwte_shared[threadID] = packed_inp1;
-            }
+    for (int b = 0; b < B; b++) {
+        x128 packed_dout = load128cs(dout + (b * T * C) + (t * C) + c);
+        for (int k = 0; k < x128::size; k++) {
+            accum[k] += (float)packed_dout[k];
         }
-        __syncthreads();
-        if (last != 0 || last_iteration) {
-            if (threadIdx.y == first) {
-                // add together all the values
-                floatX* dwte_ix = dwte + ix * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
-                x128 packed_inp2 = load128(dwte_ix);
-
-                x128 shared_data;
-                for (int k = 0; k < packed_inp1.size; k++) {
-                    tmp_dwte[k] = (float)packed_inp1[k] + (float)packed_inp2[k];
-                }
-
-                for (int j = 1; j < num_active; j++) {
-                    x128 shared_data = tmp_dwte_shared[(first+j)*blockDim.x + threadIdx.x];
-                    for (int k = 0; k < packed_inp1.size; k++) {
-                        tmp_dwte[k] += (float)shared_data[k];
-                    }
-                }
-
-                for (int k = 0; k < packed_inp1.size; k++) {
-                    stochastic_rounding(tmp_dwte[k], &packed_out[k], seed);
-                }
-                store128(dwte_ix, packed_out);
-            }
-        }
-
-        /*
-        if (last_ix != ix || last_c_id != c_id) {
-            floatX* dwte_ix = dwte + ix * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
-            x128 packed_inp1 = load128cs(dout_btc);
-            x128 packed_inp2 = load128(dwte_ix);
-
-            if (last_ix != -1) {
-                // write previous
-                floatX* dwte_last_ix = dwte + last_ix * C + (last_c_id * c_per_warp) + (threadIdx.x * x128::size);
-                for (int k = 0; k < packed_out.size; k++) {
-                    stochastic_rounding(tmp_dwte[k], &packed_out[k], seed);
-                }
-                store128(dwte_last_ix, packed_out);
-            }
-
-            for (int k = 0; k < packed_inp1.size; k++) {
-                tmp_dwte[k] = (float)packed_inp1[k] + (float)packed_inp2[k];
-            }
-        } else {
-            x128 packed_inp1 = load128cs(dout_btc);
-            for (int k = 0; k < packed_inp1.size; k++) {
-                tmp_dwte[k] += (float)packed_inp1[k];
-            }
-        }
-        */
-
-        last_ix = ix;
-        last_c_id = c_id;
     }
-}
 
-
-
-
-
-/*
-__global__ void processBuckets(int* smBucketStarts, int* smBucketSizes, uint64_t* smWorkloadIndices,
-                               floatX* dwte, const floatX* dout, const int* inp, unsigned int seed,
-                               int B, int T, int C) {
-    int smIndex = blockIdx.x;
-    int startIdx = smBucketStarts[smIndex];
-    int size = smBucketSizes[smIndex];
-    int c_per_warp = 32 * x128::size;
-
-    int last_ix = -1;
-    int last_c_id = -1;
-    float tmp_dwte[x128::size];
-    x128 packed_out;
-
-    int threadID = threadIdx.x + threadIdx.y * blockDim.x;
-
-    __shared__ x128 tmp_dwte_shared[1024];
-
-    for (int i = startIdx + threadIdx.y; i < startIdx + size; i += blockDim.y) {
-        bool last_iteration = (i-threadIdx.y+32 >= startIdx + size);
-        uint64_t idx = smWorkloadIndices[i];
-        uint64_t ix = (idx>>30ULL) & (1024*1024-1);
-
-        int c_id = (idx>>20ULL) & 1023;
-        int bt = idx & (1024*1024-1);
-        int b = bt / T;
-        int t = bt % T;
-
-        const floatX* dout_btc = dout + b * T * C + t * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
-        x128 packed_inp1 = load128cs(dout_btc);
-        __syncthreads();
-
-        uint64_t all_idx = smWorkloadIndices[i-threadIdx.y+threadIdx.x];
-        uint64_t all_ix = (all_idx>>30ULL) & (1024*1024-1);
-        // use __match_any_sync to check if this is the same all_ix as previous threads in the warp
-        int mask = __match_any_sync(0xFFFFFFFF, all_ix);
-        int leader = __ffs(mask) - 1;    // select a leader
-
-        // check if this is the last warp handling this ix
-        // 1) get most significant bit set in mask
-        int last = __clz(mask);
-        if (last != 0 || last_iteration) {
-            int first = __ffs(mask) - 1;
-            int num_active = __popc(mask); // todo don't need popc
-            if (threadIdx.y != first) {
-                // write to shared memory
-                tmp_dwte_shared[threadID] = packed_inp1;
-            }
-            __syncthreads();
-            if (threadIdx.y == first) {
-                // add together all the values
-                floatX* dwte_ix = dwte + ix * C + (c_id * c_per_warp) + (threadIdx.x * x128::size);
-                x128 packed_inp2 = load128(dwte_ix);
-
-                x128 shared_data;
-                for (int k = 0; k < packed_inp1.size; k++) {
-                    tmp_dwte[k] = (float)packed_inp1[k] + (float)packed_inp2[k];
-                }
-
-                for (int j = 1; j < num_active; j++) {
-                    x128 shared_data = tmp_dwte_shared[(first+j)*blockDim.x + threadIdx.x];
-                    for (int k = 0; k < packed_inp1.size; k++) {
-                        tmp_dwte[k] += (float)shared_data[k];
-                    }
-                }
-
-                for (int k = 0; k < packed_inp1.size; k++) {
-                    stochastic_rounding(tmp_dwte[k], &packed_out[k], seed);
-                }
-                store128(dwte_ix, packed_out);
-            }
-        }
-
-        last_ix = ix;
-        last_c_id = c_id;
+    floatX* dwpe_tc = dwpe + (t * C) + c;
+    x128 packed_dwpe = load128(dwpe_tc);
+    for (int k = 0; k < x128::size; k++) {
+        stochastic_rounding(accum[k] + (float)packed_dwpe[k], &packed_dwpe[k], seed + k);
     }
+    store128(dwpe_tc, packed_dwpe);
 }
-*/
-
-
 
 void encoder_backward(floatX* dwte, floatX* dwpe,
                     const floatX* dout, const int* inp, const int* inputs_cpu,
@@ -1609,15 +1368,14 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
     int num_warps_per_token = C / num_channels_per_warp;
     assert((C % num_channels_per_warp) == 0);
 
-    // print B/T/C and num_warps_per_token
-    std::cout << "B: " << B << ", T: " << T << ", C: " << C << ", num_warps_per_token: " << num_warps_per_token << std::endl;
-
     // Step 1: Sort inputs into buckets
+    int total_items = 0;
     std::unordered_map<uint64_t, std::vector<uint64_t>> buckets;
     for (int i = 0; i < B * T; i++) {
         for (int j = 0; j < num_warps_per_token; j++) {
             uint64_t data = i + (j<<20ULL) + ((uint64_t)inputs_cpu[i]<<30ULL);
-            buckets[inputs_cpu[i]].push_back(data);
+            buckets[j + num_warps_per_token*inputs_cpu[i]].push_back(data);
+            total_items++;
         }
     }
 
@@ -1628,72 +1386,43 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
                   return a.second.size() > b.second.size();
               });
 
-    // Step 3: Distribute the buckets to SMs
-    std::vector<std::vector<uint64_t>> smWorkloads(num_SMs); // Workloads for each SM
-    std::vector<uint64_t> smLoads(num_SMs, 0); // Vector to keep track of the load of each SM
-    std::vector<uint64_t> smBucketCounts(num_SMs, 0); // Vector to keep track of the bucket count of each SM
+    // get number of buckets
+    int num_buckets = buckets.size();
+    int* bucket_starts = new int[num_buckets];
+    int* bucket_sizes = new int[num_buckets];
+    uint64_t* workload_indices = new uint64_t[total_items];
 
-    // Priority queue to distribute buckets to the least loaded SM
-    std::priority_queue<std::pair<uint64_t, uint64_t>, std::vector<std::pair<uint64_t, uint64_t>>, std::greater<std::pair<uint64_t, uint64_t>>> pq;
-    for (int i = 0; i < num_SMs; ++i) {
-        pq.push({0, i});
-    }
-
-    // Iterate through each sorted bucket and distribute to the least loaded SM
+    int bucket_index = 0;
+    int workload_index = 0;
     for (const auto& bucket : sortedBuckets) {
-        int load = bucket.second.size();
-        auto [currentLoad, smIndex] = pq.top();
-        pq.pop();
-
-        smWorkloads[smIndex].insert(smWorkloads[smIndex].end(), bucket.second.begin(), bucket.second.end());
-        smLoads[smIndex] += load;
-        smBucketCounts[smIndex] += 1;
-
-        pq.push({smLoads[smIndex], smIndex});
-    }
-
-    // Create arrays to pass to CUDA
-    int* smBucketStarts = new int[num_SMs];
-    int* smBucketSizes = new int[num_SMs];
-    int totalItems = 0;
-    for (int i = 0; i < num_SMs; ++i) {
-        smBucketStarts[i] = totalItems;
-        smBucketSizes[i] = smLoads[i];
-        totalItems += smLoads[i];
-    }
-
-    uint64_t* smWorkloadIndices = new uint64_t[totalItems];
-    int currentIndex = 0;
-    for (int i = 0; i < num_SMs; ++i) {
-        for (uint64_t idx : smWorkloads[i]) {
-            smWorkloadIndices[currentIndex++] = idx;
+        bucket_starts[bucket_index] = workload_index;
+        bucket_sizes[bucket_index++] = bucket.second.size();
+        for (uint64_t idx : bucket.second) {
+            workload_indices[workload_index++] = idx;
         }
     }
 
-    // Print the workload distribution
-    for (int i = 0; i < num_SMs; ++i) {
-        //std::cout << "SM " << i << ": " << smBucketCounts[i] << " buckets, " << smLoads[i] << " items" << std::endl;
-    }
-
     // Allocate memory on the device
-    int *d_smBucketStarts, *d_smBucketSizes;
-    uint64_t *d_smWorkloadIndices;
-    cudaMalloc(&d_smBucketStarts, num_SMs * sizeof(int));
-    cudaMalloc(&d_smBucketSizes, num_SMs * sizeof(int));
-    cudaMalloc(&d_smWorkloadIndices, (totalItems + 32) * sizeof(uint64_t));
+    int *d_bucket_starts, *d_bucket_sizes;
+    uint64_t *d_workload_indices;
+    cudaMalloc(&d_bucket_starts, num_buckets * sizeof(int));
+    cudaMalloc(&d_bucket_sizes, num_buckets * sizeof(int));
+    cudaMalloc(&d_workload_indices, total_items * sizeof(uint64_t));
 
     // Copy data from host to device
-    cudaMemcpy(d_smBucketStarts, smBucketStarts, num_SMs * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_smBucketSizes, smBucketSizes, num_SMs * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_smWorkloadIndices, smWorkloadIndices, totalItems * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bucket_starts, bucket_starts, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bucket_sizes, bucket_sizes, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_workload_indices, workload_indices, total_items * sizeof(uint64_t), cudaMemcpyHostToDevice);
 
-    processBuckets<<<num_SMs, 32>>>(d_smBucketStarts, d_smBucketSizes, d_smWorkloadIndices, dwte, dout, inp, seed, B, T, C);
-
+    // Launch kernels
     NVTX_RANGE_FN();
-    const int N = B * T * C;
+    wte_backward_kernel<<<num_buckets, 256>>>(d_bucket_starts, d_bucket_sizes, d_workload_indices, dwte, dout, inp, seed, B, T, C);
+
+    const int N = T * C;
     const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size * 2); // each thread handles 2 elements
-    encoder_backward_kernel<<<grid_size, block_size, 0, main_stream>>>(dwte, dwpe, dout, inp, B, T, C, seed);
+    const int grid_size = CEIL_DIV(N, block_size);
+    wpe_backward_kernel<<<grid_size, block_size, 0, main_stream>>>(dwte, dwpe, dout, inp, B, T, C, seed);
+
     cudaCheck(cudaGetLastError());
 }
 
