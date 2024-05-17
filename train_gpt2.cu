@@ -55,6 +55,12 @@ This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "tokenizer.h"
 
+#include <unordered_map>
+#include <vector>
+#include <queue>
+#include <functional>
+#include <iostream>
+
 // ----------------------------------------------------------------------------
 // CUDA precision settings
 
@@ -529,50 +535,84 @@ __global__ void encoder_forward_kernel3(floatX* out,
     store128(out_btc, packed_out);
 }
 
-template <typename T>
-__device__ void atomicStochasticAdd(T* address, float val0, float val1, unsigned int seed) {
-    static_assert(sizeof(T) == 2, "Only 16-bit atomicStochasticAdd supported.");
-    float2 val = make_float2(val0, val1);
-    unsigned int* address_as_uint = (unsigned int*)address;
-    unsigned int old = *address_as_uint, assumed;
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
-    do {
-        assumed = old;
-        float2 new_fp32 = make_float2((float)(reinterpret_cast<T*>(&old)[0]) + val.x,
-                                      (float)(reinterpret_cast<T*>(&old)[1]) + val.y);
-        T new_rounded[2];
-        stochastic_rounding(new_fp32.x, &new_rounded[0], random);
-        stochastic_rounding(new_fp32.y, &new_rounded[1], random >> 16);
-        old = atomicCAS(address_as_uint, assumed, *(unsigned int*)&new_rounded);
-    } while (assumed != old);
-}
-__device__ void atomicStochasticAdd(float* address, float val0, float val1, unsigned int seed) {
-    atomicAdd(address, val0);
-    atomicAdd(address + 1, val1);
+template <int BLOCK_SIZE=256>
+__global__ void wte_backward_kernel(int* bucket_starts, int* bucket_sizes, int* d_bucket_ix, int* d_bucket_c,
+                                    int* workload_indices, floatX* dwte, const floatX* dout, const int* inp,
+                                    unsigned int seed, int B, int T, int C) {
+    int bucket = blockIdx.x;
+    int item = threadIdx.x / 32;
+    int warp_id = threadIdx.x / 32;
+    int c_per_warp = 32 * x128::size;
+
+    int start_idx = bucket_starts[bucket];
+    int size = bucket_sizes[bucket];
+    int ix = d_bucket_ix[bucket];
+    int c = d_bucket_c[bucket] * c_per_warp;
+
+    float accum[x128::size] = {0.0f};
+
+    for(; item < size; item += BLOCK_SIZE/32) {
+        int bt = workload_indices[start_idx + item];
+        int b = bt / T;
+        int t = bt % T;
+
+        const floatX* dout_btc = dout + b * T * C + t * C + c + ((threadIdx.x & 31) * x128::size);
+        x128 packed_inp1 = load128cs(dout_btc);
+        for (int k = 0; k < packed_inp1.size; k++) {
+            accum[k] += (float)packed_inp1[k];
+        }
+    }
+
+    if (size > 1) {
+        __shared__ float accum_shared[x128::size * BLOCK_SIZE];
+        for (int k = 0; k < x128::size; k++) {
+            accum_shared[threadIdx.x + k * BLOCK_SIZE] = accum[k];
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            for (int i = threadIdx.x+32; i < min(BLOCK_SIZE, size*32); i += 32) {
+                for (int k = 0; k < x128::size; k++) {
+                    accum[k] += accum_shared[i + k * BLOCK_SIZE];
+                }
+            }
+        }
+    }
+
+    if (warp_id == 0) {
+        floatX* dwte_ix = dwte + ix * C + c + (threadIdx.x * x128::size);
+        x128 packed_in_out = load128(dwte_ix);
+        for (int k = 0; k < x128::size; k++) {
+            stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
+        }
+        store128(dwte_ix, packed_in_out);
+    }
 }
 
-__global__ void encoder_backward_kernel(floatX* dwte, floatX* dwpe,
-                                        const floatX* dout, const int* inp,
-                                        int B, int T, int C, unsigned int seed) {
+__global__ void wpe_backward_kernel(floatX* dwte, floatX* dwpe,
+                                    const floatX* dout, const int* inp,
+                                    int B, int T, int C, unsigned int seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C;
-    idx *= 2; // 2 elements per thread
+    int N = T * C;
+    idx *= x128::size;
     if (idx >= N) { return; }
 
-    int bt = idx / C;
-    int b = bt / T;
-    int t = bt % T;
+    int t = idx / C;
     int c = idx % C;
+    float accum[x128::size] = {0.0f};
 
-    int ix = inp[b * T + t];
+    for (int b = 0; b < B; b++) {
+        x128 packed_dout = load128cs(dout + (b * T * C) + (t * C) + c);
+        for (int k = 0; k < x128::size; k++) {
+            accum[k] += (float)packed_dout[k];
+        }
+    }
 
-    const floatX* dout_btc = dout + b * T * C + t * C + c;
-    floatX* dwte_ix = dwte + ix * C + c;
-    floatX* dwpe_tc = dwpe + t * C + c;
-
-    float2 dout_data = make_float2(dout_btc[0], dout_btc[1]);
-    atomicStochasticAdd(dwte_ix, dout_data.x, dout_data.y, seed);
-    atomicStochasticAdd(dwpe_tc, dout_data.x, dout_data.y, seed ^ 0xFFFFFFFF);
+    floatX* dwpe_tc = dwpe + (t * C) + c;
+    x128 packed_dwpe = load128(dwpe_tc);
+    for (int k = 0; k < x128::size; k++) {
+        stochastic_rounding(accum[k] + (float)packed_dwpe[k], &packed_dwpe[k], seed + k);
+    }
+    store128(dwpe_tc, packed_dwpe);
 }
 
 __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
@@ -1335,14 +1375,90 @@ void encoder_forward(floatX* out,
 }
 
 void encoder_backward(floatX* dwte, floatX* dwpe,
-                    const floatX* dout, const int* inp,
+                    const floatX* dout, const int* inp, const int* inputs_cpu,
                     int B, int T, int C, unsigned int seed) {
     NVTX_RANGE_FN();
-    const int N = B * T * C;
+
+    // Launch wpe kernel (so we have as many things running in parallel on GPU before the CPU work)
+    const int N = T * C;
     const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size * 2); // each thread handles 2 elements
-    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C, seed);
+    const int grid_size = CEIL_DIV(N, block_size);
+    wpe_backward_kernel<<<grid_size, block_size, 0>>>(dwte, dwpe, dout, inp, B, T, C, seed);
+
+    int num_channels_per_warp = 32 * x128::size;
+    int num_warps_per_token = C / num_channels_per_warp;
+    assert((C % num_channels_per_warp) == 0);
+
+    // Step 1: Sort inputs into buckets
+    int total_items = 0;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> buckets;
+    for (uint64_t i = 0; i < B * T; i++) {
+        for (uint64_t j = 0; j < num_warps_per_token; j++) {
+            uint64_t data = i + (j<<32ULL) + ((uint64_t)inputs_cpu[i]<<42ULL);
+            buckets[j + num_warps_per_token*inputs_cpu[i]].push_back(data);
+            total_items++;
+        }
+    }
+
+    // Step 2: Sort buckets by size in descending order
+    std::vector<std::pair<uint64_t, std::vector<uint64_t>>> sortedBuckets(buckets.begin(), buckets.end());
+    std::sort(sortedBuckets.begin(), sortedBuckets.end(),
+              [](const std::pair<uint64_t, std::vector<uint64_t>>& a, const std::pair<uint64_t, std::vector<uint64_t>>& b) {
+                  return a.second.size() > b.second.size();
+              });
+
+    int num_buckets = buckets.size();
+    // TODO: HACK: only do this once outside this function
+    int* workload_indices = new int[total_items];
+    int* bucket_starts = new int[num_buckets];
+    int* bucket_sizes = new int[num_buckets];
+    int* bucket_ix = new int[num_buckets];
+    int* bucket_c = new int[num_buckets];
+
+    int bucket_index = 0;
+    int workload_index = 0;
+    for (const auto& bucket : sortedBuckets) {
+        bucket_starts[bucket_index] = workload_index;
+        bucket_sizes[bucket_index] = bucket.second.size();
+        bucket_ix[bucket_index] = (bucket.second[0] >> 42ULL) & ((1ULL<<20ULL)-1ULL);
+        bucket_c[bucket_index] =  (bucket.second[0] >> 32ULL) & ((1ULL<<10ULL)-1ULL);
+        for (uint64_t idx : bucket.second) {
+            workload_indices[workload_index++] = (int)(idx & ((1ULL<<31ULL)-1ULL));
+        }
+        bucket_index++;
+    }
+
+    // TODO: HACK: reuse scratch buffer of main allocation, do not allocate here!
+    // Allocate memory on the device
+    static bool first = true;
+    static int *d_bucket_starts, *d_bucket_sizes, *d_bucket_ix, *d_bucket_c, *d_workload_indices;
+    if (first) {
+        cudaMalloc(&d_bucket_starts, num_buckets * sizeof(int));
+        cudaMalloc(&d_bucket_sizes, num_buckets * sizeof(int));
+        cudaMalloc(&d_bucket_ix, num_buckets * sizeof(int));
+        cudaMalloc(&d_bucket_c, num_buckets * sizeof(int));
+        cudaMalloc(&d_workload_indices, total_items * sizeof(int));
+        first = false;
+    }
+
+    // TODO: merge multiple arrays together and do a single cudaMemcpy
+    // Copy data from host to device (async until the last one to avoid unnecessary CPU/GPU synchronisations)
+    cudaMemcpyAsync(d_bucket_starts, bucket_starts, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_bucket_sizes, bucket_sizes, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_bucket_ix, bucket_ix, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_bucket_c, bucket_c, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Launch wte kernel
+    wte_backward_kernel<256><<<num_buckets, 256>>>(d_bucket_starts, d_bucket_sizes, d_bucket_ix, d_bucket_c, d_workload_indices, dwte, dout, inp, seed, B, T, C);
     cudaCheck(cudaGetLastError());
+
+    // TODO: HACK: only do this once outside this function
+    delete [] workload_indices;
+    delete [] bucket_starts;
+    delete [] bucket_sizes;
+    delete [] bucket_ix;
+    delete [] bucket_c;
 }
 
 void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
@@ -2156,7 +2272,7 @@ void gpt2_zero_grad(GPT2 *model) {
     }
 }
 
-void gpt2_backward(GPT2 *model) {
+void gpt2_backward(GPT2 *model, int* inputs) {
     NVTX_RANGE_FN();
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -2293,7 +2409,7 @@ void gpt2_backward(GPT2 *model) {
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
-    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C, random_u32(&model->rng_state));
+    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state));
 }
 
 // Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
@@ -2819,7 +2935,7 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward(&model);
+            gpt2_backward(&model, train_loader.inputs);
         }
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
