@@ -539,72 +539,95 @@ __global__ void encoder_forward_kernel3(floatX* out,
 }
 
 template <int BLOCK_SIZE=256>
-__global__ void wte_backward_kernel(int* bucket_starts, int* bucket_sizes, int* d_bucket_ix, int* d_bucket_c,
-                                    int* workload_indices, floatX* dwte, const floatX* dout, const int* inp,
+__global__ void wte_backward_kernel(floatX* dwte,
+                                    const int4* bucket_info, const int* workload_indices, const floatX* dout, const int* inp,
                                     unsigned int seed, int B, int T, int C) {
+    // In order to be deterministic, we preprocess the inputs on the cpu into "buckets"
+    // Each bucket corresponds to (WARP_SIZE * x128::size) channels for a single vocabulary token
+    // Each thread handles x128::size channels, e.g. 256 per warp for BF16
+    // Each block handles (BLOCK_SIZE / WARP_SIZE) elements in a single bucket in parallel
+    // If a bucket has less than 8 elements, some warps will return immediately
+    // If a bucket has more than 8 elements, we will loop over all of them
+    // The buckets are sorted on the CPU so the largest buckets start 1st
     int bucket = blockIdx.x;
-    int item = threadIdx.x / 32;
-    int warp_id = threadIdx.x / 32;
-    int c_per_warp = 32 * x128::size;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int c_per_warp = WARP_SIZE * x128::size;
 
-    int start_idx = bucket_starts[bucket];
-    int size = bucket_sizes[bucket];
-    int ix = d_bucket_ix[bucket];
-    int c = d_bucket_c[bucket] * c_per_warp;
+    int bucket_start_idx = bucket_info[bucket].x;
+    int bucket_size = bucket_info[bucket].y;
+    int bucket_ix = bucket_info[bucket].z;
+    int c = bucket_info[bucket].w * c_per_warp + (lane_id * x128::size);
+
+    // Each thread handles "x128::size" channels, so at fp8, each warp would handle 512 channels
+    // If C is not a multiple of this (e.g. 768), some buckets/c_groups cannot use the entire warp
+    if (c >= C) { return; }
+    // Exit early if this is a small bucket and this warp doesn't have any items to process
+    if (warp_id >= bucket_size) { return; }
 
     float accum[x128::size] = {0.0f};
+    __shared__ float accum_shared[x128::size * BLOCK_SIZE];
 
-    for(; item < size; item += BLOCK_SIZE/32) {
-        int bt = workload_indices[start_idx + item];
+    for(int item = warp_id; item < bucket_size; item += BLOCK_SIZE/WARP_SIZE) {
+        int bt = workload_indices[bucket_start_idx + item];
         int b = bt / T;
         int t = bt % T;
 
-        const floatX* dout_btc = dout + b * T * C + t * C + c + ((threadIdx.x & 31) * x128::size);
+        const floatX* dout_btc = dout + b * T * C + t * C + c;
         x128 packed_inp1 = load128cs(dout_btc);
         for (int k = 0; k < packed_inp1.size; k++) {
             accum[k] += (float)packed_inp1[k];
         }
     }
 
-    if (size > 1) {
-        __shared__ float accum_shared[x128::size * BLOCK_SIZE];
+    if (warp_id != 0) {
+        // we accumulate into warp 0, so only the other warps need to write to shared memory
         for (int k = 0; k < x128::size; k++) {
             accum_shared[threadIdx.x + k * BLOCK_SIZE] = accum[k];
         }
-        __syncthreads();
-        if (warp_id == 0) {
-            for (int i = threadIdx.x+32; i < min(BLOCK_SIZE, size*32); i += 32) {
-                for (int k = 0; k < x128::size; k++) {
-                    accum[k] += accum_shared[i + k * BLOCK_SIZE];
-                }
-            }
+        return; // only warp 0 is needed after writing to shared memory
+    }
+
+    // Read dwte for warp 0 even if other warps are not finished yet to maximise latency tolerance
+    floatX* dwte_ix = dwte + bucket_ix * C + c;
+    x128 packed_in_out = load128(dwte_ix);
+
+    // note: threads which have returned are considered synchronised by CUDA so no risk of deadlock
+    __syncthreads();
+
+    // Accumulate into warp 0's registers by reading the values of the other warps in shared memory
+    for (int i = threadIdx.x+WARP_SIZE; i < min(BLOCK_SIZE, bucket_size*WARP_SIZE); i += WARP_SIZE) {
+        for (int k = 0; k < x128::size; k++) {
+            accum[k] += accum_shared[i + k * BLOCK_SIZE];
         }
     }
 
-    if (warp_id == 0) {
-        floatX* dwte_ix = dwte + ix * C + c + (threadIdx.x * x128::size);
-        x128 packed_in_out = load128(dwte_ix);
-        for (int k = 0; k < x128::size; k++) {
-            stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
-        }
-        store128(dwte_ix, packed_in_out);
+    // Add the result to dwte and write back to global memory (read-modify-write)
+    for (unsigned int k = 0; k < x128::size; k++) {
+        // We use stochastic rounding to go from FP32 to BF16 but the seed should be deterministic
+        stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
     }
+    store128(dwte_ix, packed_in_out);
 }
 
-__global__ void wpe_backward_kernel(floatX* dwte, floatX* dwpe,
+__global__ void wpe_backward_kernel(floatX* dwpe,
                                     const floatX* dout, const int* inp,
                                     int B, int T, int C, unsigned int seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = T * C;
-    idx *= x128::size;
-    if (idx >= N) { return; }
+    // Each thread handles x128::size "channel positions", e.g. 256 per warp for BF16
+    // For gpt2-124M BF16, C=768 and T=1024, so 3 warps per channel and 3072 warps in total
+    // For each "channel position" we sum the gradients for every batch at that C/T element
+    // This way each dwte element is only updated once, and the kernel is fully deterministic!
+    // The previous kernel was not deterministic, as batches were aggregated with atomicAdd
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    if (idx >= T * C) { return; }
 
+    // if C is not a multiple of WARP_SIZE*x128::size, it's OK for some warps to handle multiple t
     int t = idx / C;
     int c = idx % C;
     float accum[x128::size] = {0.0f};
 
     for (int b = 0; b < B; b++) {
-        x128 packed_dout = load128cs(dout + (b * T * C) + (t * C) + c);
+        x128 packed_dout = load128cs(dout + (b * T * C) + (t * C) + c); // will never be read again
         for (int k = 0; k < x128::size; k++) {
             accum[k] += (float)packed_dout[k];
         }
@@ -612,7 +635,8 @@ __global__ void wpe_backward_kernel(floatX* dwte, floatX* dwpe,
 
     floatX* dwpe_tc = dwpe + (t * C) + c;
     x128 packed_dwpe = load128(dwpe_tc);
-    for (int k = 0; k < x128::size; k++) {
+    for (unsigned int k = 0; k < x128::size; k++) {
+        // We use stochastic rounding to go from FP32 to BF16 but the seed should be deterministic
         stochastic_rounding(accum[k] + (float)packed_dwpe[k], &packed_dwpe[k], seed + k);
     }
     store128(dwpe_tc, packed_dwpe);
@@ -823,10 +847,9 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     // directly autoregressive, so we only compute the lower triangular part
     // uses the online softmax algorithm
     assert(T % 4  == 0);
-    const int warp_size = 32;
-    int lane_id = threadIdx.x % warp_size;
-    int warp_id = threadIdx.x / warp_size;
-    int num_warps = blockDim.x / warp_size;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
 
     // micro-optimization: we iterate backwards so that
     // after the softmax backward operation completes, the cache retains the
@@ -849,7 +872,7 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     float sumval = 0.0f;
 
     const floatX* x_aligned = reinterpret_cast<const floatX*>(__builtin_assume_aligned(x, 16));
-    for (int i = lane_id; i < pos_by_4; i += warp_size) {
+    for (int i = lane_id; i < pos_by_4; i += WARP_SIZE) {
         float regarray[4];
         for (int k = 0; k < 4; ++k) {
             regarray[k] = (float)x_aligned[4*i + k];
@@ -878,7 +901,7 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
-    for (int i = lane_id; i <= own_pos; i += warp_size) {
+    for (int i = lane_id; i <= own_pos; i += WARP_SIZE) {
         // recalculation is faster than doing the round-trip through memory.
         float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
         __stcs(out + idx * T + i, (floatX)(ev * norm));
@@ -1394,43 +1417,41 @@ void encoder_forward(floatX* out,
     cudaCheck(cudaGetLastError());
 }
 
-void encoder_backward(floatX* dwte, floatX* dwpe,
-                    const floatX* dout, const int* inp, const int* inputs_cpu,
-                    int B, int T, int C, unsigned int seed) {
+// Fully deterministic (see comments in wte_backward_kernel and wpe_backward_kernel for more details)
+void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
+                      int* workload_indices, int4* bucket_info,    // cpu scratch buffers
+                      const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
+                      int B, int T, int C, unsigned int seed) {
     NVTX_RANGE_FN();
 
-    int num_channels_per_warp = 32 * x128::size;
-    int C_groups = C / num_channels_per_warp;
-    assert((C % num_channels_per_warp) == 0);
-
-    // TODO: HACK: only do this once outside this function
-    static bool first = true;
-    static int* workload_indices = new int[B*T*C_groups];
-    static int* bucket_starts = new int[B*T*C_groups];
-    static int* bucket_sizes = new int[B*T*C_groups];
-    static int* bucket_ix = new int[B*T*C_groups];
-    static int* bucket_c = new int[B*T*C_groups];
-
-    // Launch wpe kernel (so we have more things running in parallel on GPU before the CPU work)
-    const int N = T * C / x128::size;
+    // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
     const int block_size = 256;
+    const int N = T * C / x128::size;
     const int grid_size = CEIL_DIV(N, block_size);
-    wpe_backward_kernel<<<grid_size, block_size, 0>>>(dwte, dwpe, dout, inp, B, T, C, seed);
+    wpe_backward_kernel<<<grid_size, block_size, 0>>>(dwpe, dout, inp, B, T, C, seed);
+
+    // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
+    // todo - this is trivially true given hardcoded scratch buffer size here, is this useful?
+    int num_c_groups = CEIL_DIV(C, x128::size * WARP_SIZE);
+    assert(B*T*num_c_groups * (sizeof(int4)+sizeof(int)) <= B*T*3*C * sizeof(floatX));
 
     // Step 1: Sort inputs into buckets
     int total_items = 0;
     std::unordered_map<uint64_t, std::vector<uint64_t>> buckets;
-    for (uint64_t i = 0; i < B * T; i++) {
-        for (uint64_t j = 0; j < C_groups; j++) {
-            uint64_t data = i + (j<<32ULL) + ((uint64_t)inputs_cpu[i]<<42ULL);
-            buckets[j + C_groups * inputs_cpu[i]].push_back(data);
+    for (uint64_t bt = 0; bt < B * T; bt++) {
+        for (uint64_t c_group = 0; c_group < num_c_groups; c_group++) {
+            // todo - passing c_group/inputs_cpu[bt] in data to avoid a second hash lookup is a bit hacky
+            uint64_t data = bt + (c_group<<32ULL) + ((uint64_t)inputs_cpu[bt]<<42ULL);
+            buckets[c_group + num_c_groups * inputs_cpu[bt]].push_back(data);
             total_items++;
         }
     }
 
     // Step 2: Sort buckets by size in descending order
+    // this is so the largest buckets are processed first by the GPU
+    // otherwise, if they started late, they would still be running with the rest of the GPU idle
     std::vector<std::pair<uint64_t, std::vector<uint64_t>>> sortedBuckets(buckets.begin(), buckets.end());
-    std::sort(sortedBuckets.begin(), sortedBuckets.end(),
+    std::sort(sortedBuckets.begin(), sortedBuckets.end(), // ugly because we don't have a typedef for the std::pair
               [](const std::pair<uint64_t, std::vector<uint64_t>>& a, const std::pair<uint64_t, std::vector<uint64_t>>& b) {
                   return a.second.size() > b.second.size();
               });
@@ -1439,38 +1460,27 @@ void encoder_backward(floatX* dwte, floatX* dwpe,
     int bucket_index = 0;
     int workload_index = 0;
     for (const auto& bucket : sortedBuckets) {
-        bucket_starts[bucket_index] = workload_index;
-        bucket_sizes[bucket_index] = bucket.second.size();
-        bucket_ix[bucket_index] = (bucket.second[0] >> 42ULL) & ((1ULL<<20ULL)-1ULL);
-        bucket_c[bucket_index] =  (bucket.second[0] >> 32ULL) & ((1ULL<<10ULL)-1ULL);
+        bucket_info[bucket_index].x = workload_index; // bucket start
+        bucket_info[bucket_index].y = bucket.second.size(); // bucket size
+        bucket_info[bucket_index].z = (bucket.second[0] >> 42ULL) & ((1ULL<<20ULL)-1); // bucket ix
+        bucket_info[bucket_index].w = (bucket.second[0] >> 32ULL) & ((1ULL<<10ULL)-1); // bucket c
+
         for (uint64_t idx : bucket.second) {
             workload_indices[workload_index++] = (int)(idx & ((1ULL<<31ULL)-1ULL));
         }
         bucket_index++;
     }
 
-    // TODO: HACK: reuse scratch buffer of main allocation, do not allocate here!
-    // Allocate memory on the device
-    static int *d_bucket_starts, *d_bucket_sizes, *d_bucket_ix, *d_bucket_c, *d_workload_indices;
-    if (first) {
-        cudaMalloc(&d_bucket_starts, B*T*C_groups * sizeof(int));
-        cudaMalloc(&d_bucket_sizes, B*T*C_groups * sizeof(int));
-        cudaMalloc(&d_bucket_ix, B*T*C_groups * sizeof(int));
-        cudaMalloc(&d_bucket_c, B*T*C_groups * sizeof(int));
-        cudaMalloc(&d_workload_indices, total_items * sizeof(int));
-        first = false;
-    }
-
-    // TODO: merge multiple arrays together and do a single cudaMemcpy
-    // Copy data from host to device (async until the last one to avoid unnecessary CPU/GPU synchronisations)
-    cudaMemcpyAsync(d_bucket_starts, bucket_starts, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpyAsync(d_bucket_sizes, bucket_sizes, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpyAsync(d_bucket_ix, bucket_ix, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpyAsync(d_bucket_c, bucket_c, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    // Step 3: Copy data from host to device (async until the last one to avoid synchronising CPU/GPU twice)
+    // todo - could use CUDA events (even without streams) to avoid CPU/GPU synchronisation completely
+    int4* d_bucket_info = (int4*)scratch;
+    int*  d_workload_indices = (int*)(scratch + B*T*num_c_groups * sizeof(int4));
+    cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice);
     cudaMemcpy(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice);
 
     // Launch wte kernel
-    wte_backward_kernel<256><<<num_buckets, 256>>>(d_bucket_starts, d_bucket_sizes, d_bucket_ix, d_bucket_c, d_workload_indices, dwte, dout, inp, seed, B, T, C);
+    // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
+    wte_backward_kernel<256><<<num_buckets, 256>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -2056,6 +2066,10 @@ typedef struct {
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
     int use_master_weights;
     int recompute;
+    // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
+    int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
+    int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -2131,6 +2145,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->inputs = NULL;
     model->targets = NULL;
     model->cpu_losses = NULL;
+    model->workload_indices = NULL;
+    model->bucket_info = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
@@ -2330,6 +2346,11 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
+        // initialise cpu scratch buffers for encoder backward
+        size_t num_c_groups = model->config.channels / (WARP_SIZE * x128::size);
+        assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
+        model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
+        model->bucket_info = (int4*)mallocCheck(sizeof(int4) * model->batch_size * model->seq_len * num_c_groups);
     }
 
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
@@ -2350,7 +2371,8 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     cudaCheck(cudaMemset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX)));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
-    float* scratchF = (float*)acts.output;
+    float*  scratchF = (float*)acts.output;
+    floatX* scratchX = (floatX*)acts.output;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
@@ -2432,7 +2454,6 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
         floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
-        floatX* scratchX =  (floatX*)acts.output;
         attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
         #endif
 
@@ -2441,7 +2462,8 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
-    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state));
+    encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
+                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state));
 }
 
 // Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
@@ -2557,6 +2579,8 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->inputs));
     cudaCheck(cudaFree(model->targets));
     cudaFreeHost(model->cpu_losses);
+    free(model->workload_indices);
+    free(model->bucket_info);
 }
 
 // ----------------------------------------------------------------------------
@@ -2586,7 +2610,7 @@ void common_free(GPT2 &model) {
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
-    create_cudnn();
+    destroy_cudnn();
 }
 
 #ifndef TESTING
