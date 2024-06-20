@@ -8,6 +8,9 @@ Matrix Multiplication, with help from cuBLASLt
 #include "cuda_utils.cuh"
 #include "cublas_common.h"
 
+// GELU is now part of matmul (as it is fused via cuBLASLt for H100)
+#include "gelu.cuh"
+
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
@@ -103,82 +106,142 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 // kernel launchers
 
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
-void matmul_forward_cublaslt(floatX* out,
-                     floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC, cudaStream_t stream) {
+void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* bias,
+                     int m, int n, int k, cudaStream_t stream, bool transA=true, bool transB=false,
+                     int batch_count=0, size_t strideA=0, size_t strideB=0, size_t strideOut=0,
+                     bool accumulate=false, floatX* pre_gelu=NULL) {
     NVTX_RANGE_FN();
-    int has_bias = (bias != NULL);
+    bool has_bias = (bias != NULL);
+    bool has_gelu = (pre_gelu != NULL);
 
-    // check bias alignment
-    if(((uintptr_t)bias % 16) != 0) {
-        printf("Bias pointer is not aligned (cuBLASLt requirement)!\n");
+    // check alignments for all pointers (only need 16 bytes alignment in some modes but it never hurts to be aligned perf-wise!)
+    if(((uintptr_t)a % 16) != 0 || ((uintptr_t)b % 16) != 0 || ((uintptr_t)d % 16) != 0 || ((uintptr_t)bias % 16) != 0) {
+        printf("One of the pointers is not aligned (cuBLASLt requirement)!\n");
         exit(EXIT_FAILURE);
     }
 
-    // these need to be in FP16 if and only if alpha/beta are CUBLAS_COMPUTE_16F
-    const float alpha = 1.0f, beta = 0.0f;
-
     int returnedResults = 0;
     cublasLtMatmulDesc_t operationDesc;
+    cublasLtMatrixLayout_t ALayout;
+    cublasLtMatrixLayout_t BLayout;
+    cublasLtMatrixLayout_t DLayout;
+    cublasLtMatrixLayout_t CLayout;
     cublasLtMatmulPreference_t preference;
-    cublasLtMatrixLayout_t weightLayout;
-    cublasLtMatrixLayout_t inputLayout;
-    cublasLtMatrixLayout_t outputLayout;
-    cublasLtMatrixLayout_t biasLayout;
     cublasLtMatmulHeuristicResult_t heuristic;
 
     // create the operation descriptor
     cublasOperation_t opNoTranspose = CUBLAS_OP_N;
     cublasOperation_t opTranspose = CUBLAS_OP_T;
-    cublasLtEpilogue_t epilogueBias = has_bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
 
     cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute, CUDA_R_32F)); // FP16 if CUBLAS_COMPUTE_16F
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opNoTranspose, sizeof(opNoTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogueBias, sizeof(epilogueBias)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, (transA)  ? &opTranspose : &opNoTranspose,   sizeof(opTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, (transB) ? &opTranspose   : &opNoTranspose, sizeof(opNoTranspose)));
 
-    // define matrix layouts
-    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUBLAS_LOWP, C, OC, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUBLAS_LOWP, C, B*T, C));
-    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUBLAS_LOWP, OC, B*T, OC));
-    cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, CUBLAS_LOWP, OC, 1, OC));
+    // Define matrix layouts
+    if (transA) {
+        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, CUBLAS_LOWP, k, m, k));
+    } else {
+        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, CUBLAS_LOWP, m, k, m));
+    }
+    if (transB) {
+        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, CUBLAS_LOWP, n, k, n));
+    } else {
+        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, CUBLAS_LOWP, k, n, k));
+    }
+    // cuBLASLt requires C in FP8 mode to be BF16 or FP32...
+    cublasCheck(cublasLtMatrixLayoutCreate(&CLayout, (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP, m, n, m));
+    cublasCheck(cublasLtMatrixLayoutCreate(&DLayout, CUBLAS_LOWP, m, n, m));
+
+    if (batch_count) {
+        cublasCheck(cublasLtMatrixLayoutSetAttribute(ALayout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        cublasCheck(cublasLtMatrixLayoutSetAttribute(BLayout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        cublasCheck(cublasLtMatrixLayoutSetAttribute(CLayout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+        cublasCheck(cublasLtMatrixLayoutSetAttribute(DLayout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+
+        cublasCheck(cublasLtMatrixLayoutSetAttribute(ALayout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideA, sizeof(strideA)));
+        cublasCheck(cublasLtMatrixLayoutSetAttribute(BLayout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideB, sizeof(strideB)));
+        cublasCheck(cublasLtMatrixLayoutSetAttribute(CLayout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideOut, sizeof(strideOut)));
+        cublasCheck(cublasLtMatrixLayoutSetAttribute(DLayout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideOut, sizeof(strideOut)));
+    }
 
     // create a preference handle with specified max workspace
     cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
     cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
+    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
+
+    cublasLtEpilogue_t epilogue;
+    if (has_gelu) {
+        int64_t gelu_ld = m; // todo - is this affected by anything else?
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD, &gelu_ld, sizeof(gelu_ld)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER, &pre_gelu, sizeof(pre_gelu)));
+        epilogue = has_bias ? CUBLASLT_EPILOGUE_GELU_AUX_BIAS : CUBLASLT_EPILOGUE_GELU_AUX;
+    } else if(has_bias){
+        epilogue = CUBLASLT_EPILOGUE_BIAS;
+    } else {
+        epilogue = CUBLASLT_EPILOGUE_DEFAULT;
+    }
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+
+    if (has_bias) {
+        // cuBLASLt requires bias in FP8 mode to be BF16...
+        cublasDataType_t bias_data_type = (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP; // force BF16 bias for FP8 mode
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_data_type, sizeof(bias_data_type)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    }
+
+    // Set scale type to FP32 (needs to be FP16 if and only if using CUBLAS_COMPUTE_16F)
+    const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
+    cublasDataType_t scale_type = CUDA_R_32F;
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
 
     // find a suitable algorithm
     cublasCheck(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc,
-        weightLayout, inputLayout, outputLayout, outputLayout,
+        ALayout, BLayout, CLayout, DLayout,
         preference, 1, &heuristic, &returnedResults));
     if (returnedResults == 0) {
-        printf("No cuBLASLt algorithm: B: %d, T: %d, C: %d, OC: %d, bias: %d\n", B, T, C, OC, has_bias);
+        printf("No cuBLASLt algorithm: n: %d, k: %d, m: %d, bias: %d\n", n, k, m, has_bias);
         exit(EXIT_FAILURE);
     }
 
-    generate_analysis(weight, C*OC, "matmul_fwd_weight");
-    generate_analysis(inp, C*B*T, "matmul_fwd_inp");
+    generate_analysis(a, k*m, "matmul_fwd_weight");
+    generate_analysis(b, k*n, "matmul_fwd_inp");
     if (has_bias) {
-        generate_analysis(bias, OC, "matmul_fwd_bias");
+        generate_analysis(bias, m, "matmul_fwd_bias");
     }
 
     // call the matmul
     cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
-        &alpha, weight, weightLayout, inp, inputLayout, &beta,
-        out, outputLayout, out, outputLayout, &heuristic.algo,
+        &alpha, a, ALayout, b, BLayout, &beta,
+        d, CLayout, d, DLayout, &heuristic.algo,
         cublaslt_workspace, cublaslt_workspace_size, stream));
 
-    generate_analysis(out, (size_t)OC*(size_t)B*(size_t)T, "matmul_fwd_act_out");
+    generate_analysis(d, (size_t)m*(size_t)n, "matmul_fwd_act_out");
 
     // cleanups
     cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
     cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
-    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
-    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(ALayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(BLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(CLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(DLayout));
+}
+
+// this is a slightly confusing wrapper that we should maybe get rid of...
+ // m=OC, n=B*T, k=C with a=weight and b=inp
+void matmul_forward_cublaslt(floatX* out,
+                     floatX* inp, floatX* weight, floatX* bias,
+                     int B, int T, int C, int OC, cudaStream_t stream,
+                     floatX* pre_gelu=NULL) {
+    // Only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (???)
+    #if __CUDA_ARCH__ < 900
+    if (pre_gelu) {
+        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL);
+        gelu_forward(out, pre_gelu, B*T*OC, stream);
+    } else
+    #endif
+    {
+        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu);
+    }
 }
 
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
@@ -186,7 +249,6 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                      float* dbias_buffer,
                      int B, int T, int C, int OC, cudaStream_t stream) {
     NVTX_RANGE_FN();
-    float one = 1.0f, zero = 0.0f;
 
     generate_analysis(dout, (size_t)B*(size_t)T*(size_t)OC, "matmul_bwd_in_dout");
     generate_analysis(weight, C*OC, "matmul_bwd1_in_w");
@@ -219,20 +281,15 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     }
 
     // backward to input, uses = in the backward pass (set the gradient)
-    cublasCheck(cublasSetStream(cublas_handle, stream));
-    cublasCheck(cublasSetWorkspace(cublas_handle, cublaslt_workspace, cublaslt_workspace_size));
-    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &one,
-                             weight, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &zero,
-                             dinp, CUBLAS_LOWP, C, cublas_compute, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    matmul_cublaslt(dinp, weight, dout, NULL, C, B*T, OC, stream, false, false);
 
     generate_analysis(dinp, (size_t)C*(size_t)B*(size_t)T, "matmul_bwd1_agrad_dinp");
     generate_analysis(inp, (size_t)C*(size_t)B*(size_t)T, "matmul_bwd2_in_inp");
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
-    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &one,
-                             inp, CUBLAS_LOWP, C, dout, CUBLAS_LOWP, OC, &one,
-                             dweight, CUBLAS_LOWP, C, cublas_compute, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    cudaCheck(cudaGetLastError());
+    // but if this is the 1st micro-step, then dweight will be zero, and we can skip the accumulation
+    matmul_cublaslt(dweight, inp, dout, NULL, C, OC, B*T, stream, false, true, 0, 0, 0, 0,
+                    global_current_micro_step == 0 ? false : true);
 
     generate_analysis(dweight, (size_t)C*(size_t)OC, "matmul_bwd2_wgrad_dweight");
 }

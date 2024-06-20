@@ -2,6 +2,13 @@
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
+// TODO - make loss scaling configurable on the command line?
+#ifdef ENABLE_FP32
+constexpr float LOSS_SCALING_FACTOR = 1.0f;
+#else
+constexpr float LOSS_SCALING_FACTOR = (float)(1<<10);
+#endif
+
 // todo where to put this, really should NOT be here, or hardcoded, or...
 #define ENABLE_ANALYSIS_STATS
 #ifdef ENABLE_ANALYSIS_STATS
@@ -66,8 +73,8 @@ uint global_current_micro_step = 0;
 #include "llmc/encoder.cuh"
 // defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
 #include "llmc/layernorm.cuh"
-// defines: gelu_forward, gelu_backward_inplace
-#include "llmc/gelu.cuh"
+// defines: matmul_cublaslt, matmul_forward, matmul_backward, gelu_forward, gelu_backward_inplace
+#include "llmc/matmul.cuh"
 #ifdef ENABLE_CUDNN
 // defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
 #include "llmc/cudnn_att.h"
@@ -75,8 +82,6 @@ uint global_current_micro_step = 0;
 // defines: attention_forward, attention_backward
 #include "llmc/attention.cuh"
 #endif
-// defines: matmul_forward, matmul_backward
-#include "llmc/matmul.cuh"
 // defines: fused_classifier
 #include "llmc/fused_classifier.cuh"
 // defines: adamw_kernel3
@@ -530,7 +535,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
             // the layernorm parameters are all initialized to 1
             if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
                 for (size_t j = 0; j < model->param_elements[i]; j++) {
-                    params_memory_cpu[offset + j] = 1.0f;
+                    params_memory_cpu[offset + j] = (floatX)1.0f;
                 }
             }
             // weights tensors are handled here
@@ -691,8 +696,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
 
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
+        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch);
         matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
 
         // OK, fusion across blocks.
@@ -1161,13 +1165,11 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     nvtxNameCudaStreamA(main_stream, "main stream");
 
     // set up cuBLAS and cuBLASLt
-    cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8 && override_enable_tf32;
-    cublasCheck(cublasSetMathMode(cublas_handle, enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
     cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
     #ifdef ENABLE_CUDNN
@@ -1184,7 +1186,6 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
 void common_free(GPT2 &model) {
     cudaCheck(cudaStreamDestroy(main_stream));
     cudaCheck(cudaFree(cublaslt_workspace));
-    cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
     #ifdef ENABLE_CUDNN
     destroy_cudnn();

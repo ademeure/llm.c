@@ -104,7 +104,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
             float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
             packed_probs[k] = (floatX)prob;
             float indicator = (element == ix) ? 1.0f : 0.0f;
-            packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
+            packed_logits_vec[k] = (floatX)((prob - indicator) * dloss * LOSS_SCALING_FACTOR);
         }
         if (WriteLogits){
             // reduce cache persistence for the overwritten logits
@@ -122,7 +122,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     for (int i = threadIdx.x + unaligned_start; i < V; i++) {
         float prob = expf((float)logits_vec[i] - sp.Offset) * sp.Scale;
         float indicator = (i == ix) ? 1.0f : 0.0f;
-        float dlogit = (prob - indicator) * dloss;
+        float dlogit = (prob - indicator) * dloss * LOSS_SCALING_FACTOR;
         if (WriteLogits){
             __stcs(logits + idx * P + i, (floatX)dlogit);
         }

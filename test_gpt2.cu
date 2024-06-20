@@ -236,7 +236,7 @@ int main(int argc, char *argv[]) {
                     // low-precision tensor => convert to float
                     assert(model.param_sizeof[i] == sizeof(floatX)); // floatX is the single non-float supported atm
                     for (size_t j = 0; j < model.param_elements[i]; j++) {
-                        dst_iterator[j] = ((floatX*)src_iterator)[j]; // convert to float
+                        dst_iterator[j] = (float)(((floatX*)src_iterator)[j]) / LOSS_SCALING_FACTOR; // convert to float
                     }
                 }
                 // for convenience record the position of comparison for reality vs. expectation

@@ -23,7 +23,7 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     if (idx >= num_parameters) { return; }  // guard
 
     // get the gradient, m, and v for this parameter
-    float grad = grad_scale * (float)grads_memory[idx];
+    float grad = grad_scale * ((float)grads_memory[idx]) / LOSS_SCALING_FACTOR;
     float m = m_memory[idx];
     float v = v_memory[idx];
     // update the first moment (momentum)

@@ -17,7 +17,8 @@ __device__ float global_norm_squared_for_range(const T* data, size_t count) {
     size_t grid_width = blockDim.x * gridDim.x;
     float accumulator = 0.f;
     for(size_t i = index; i < count; i += grid_width) {
-        accumulator += (float)data[i] * (float)data[i];
+        float scaled_data = ((float)data[i]) / LOSS_SCALING_FACTOR;
+        accumulator += scaled_data * scaled_data;
     }
     // block-level reduce
     return blockReduce<float, warpReduceSum>(accumulator);

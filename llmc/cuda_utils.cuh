@@ -27,10 +27,10 @@ struct alignas(16) Packed128 {
         return result;
     }
     __device__ static Packed128 zeros() {
-        return constant(0.f);
+        return constant((ElementType)0.f);
     }
     __device__ static Packed128 ones() {
-        return constant(1.f);
+        return constant((ElementType)1.f);
     }
 
     __device__ ElementType& operator[](int index) {
@@ -99,6 +99,16 @@ __device__ float cast_value<float, half>(half val) {
 template<>
 __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
     return __bfloat162float(val);
+}
+
+template<>
+__device__ float cast_value<float, __nv_fp8_e4m3>(__nv_fp8_e4m3 val) {
+    return float(val);
+}
+
+template<>
+__device__ float cast_value<float, __nv_fp8_e5m2>(__nv_fp8_e5m2 val) {
+    return float(val);
 }
 
 template<typename Td, typename Ts>
@@ -208,6 +218,27 @@ __device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out
     unsigned int rounded_bits = float_bits & 0x0000FFFF;
     float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
     *out = __float2bfloat16_rn(__uint_as_float(float_bits));
+}
+// WIP INEFFICIENT FP8
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e5m2 *out, unsigned int seed) {
+    // todo - is this stochastic rounding *too good*? can we cut any corners?
+    // makes sure each thread gets a different random number
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x001FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x001FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x001FFFFF) : (float_bits  & ~0x001FFFFF);
+    *out = __nv_fp8_e5m2(__uint_as_float(float_bits));
+}
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e4m3 *out, unsigned int seed) {
+    // todo - is this stochastic rounding *too good*? can we cut any corners?
+    // makes sure each thread gets a different random number
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x000FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x000FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x000FFFFF) : (float_bits  & ~0x000FFFFF);
+    *out = __nv_fp8_e4m3(__uint_as_float(float_bits));
 }
 __device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
     *out = (float)in; // todo - implement this...
@@ -381,6 +412,8 @@ __host__ void reset_analysis() {
 }
 
 __host__ void write_analysis() {
+    return;
+
     unsigned int* analysis_data_cpu = (unsigned int*)malloc(ANALYSIS_MEMORY_SIZE);
     cudaMemcpy(analysis_data_cpu, analysis_memory, ANALYSIS_MEMORY_SIZE, cudaMemcpyDeviceToHost);
 
@@ -478,6 +511,8 @@ __host__ void write_analysis() {
 
 template<typename T>
 __host__ void generate_analysis(const T* tensor, size_t count, const char* name) {
+    return;
+
     if (current_analysis >= MAX_ANALYSIS_STATS) {
         if (current_analysis == MAX_ANALYSIS_STATS) { // only warn 1st time we run out of space
             printf("Exceeded maximum number of analysis stats per dump (%d)\n", MAX_ANALYSIS_STATS);
@@ -490,10 +525,10 @@ __host__ void generate_analysis(const T* tensor, size_t count, const char* name)
     // Check if tensor name is in the hashmap
     if (analysis_tensor_names.find(std::make_pair(name, global_current_layer)) != analysis_tensor_names.end()) {
         // Add " [2]" unless also already in hashmap, then add " [3]", etc...
-        analysis_names[current_analysis] = (char*)malloc(strlen(name) + 7);
+        analysis_names[current_analysis] = (char*)malloc(strlen(name) + 8);
         int i = 2;
         do {
-            assert(i < 100);
+            assert(i < 1000);
             sprintf(analysis_names[current_analysis], "%s [%d]", name, i++);
         } while (analysis_tensor_names.find(std::make_pair(analysis_names[current_analysis], global_current_layer)) != analysis_tensor_names.end());
     } else {
