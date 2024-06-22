@@ -78,6 +78,8 @@ __device__ void store128cg(ElementType* target, Packed128<ElementType> value) {
 // short-form typedefs
 typedef Packed128<float> f128;
 typedef Packed128<floatX> x128;
+typedef Packed128<__nv_fp8_e4m3> e4m3_128;
+typedef Packed128<__nv_fp8_e5m2> e5m2_128;
 
 // ----------------------------------------------------------------------------
 // Copy, cast functions

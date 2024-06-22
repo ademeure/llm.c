@@ -105,15 +105,20 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 // ----------------------------------------------------------------------------
 // kernel launchers
 
+#define ABSMAX_OUTER_LOOP 4
+
 template <typename T>
 __global__ void get_absmax_kernel(const T* inp, float* absmax_scalar, size_t N, float extra_ratio=1.0f) {
-    size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size * ABSMAX_OUTER_LOOP;
     float absmax = 0.0f;
 
     if (idx < N) {
-        for(int k = 0; k < x128::size; ++k) {
-            float x = (float)inp[idx+k];
-            absmax = max(absmax, abs(x));
+        for (int i = 0; i < ABSMAX_OUTER_LOOP; i++) {
+            for (int k = 0; k < x128::size; ++k) {
+                float x = (float)inp[idx + k];
+                absmax = max(absmax, fabs(x));
+            }
+            idx += x128::size;
         }
     }
     absmax = blockReduce<warpReduceMax>(absmax);
@@ -125,21 +130,33 @@ __global__ void get_absmax_kernel(const T* inp, float* absmax_scalar, size_t N, 
 }
 
 __global__ void get_absmax_kernel(const floatX* inp, float* absmax_scalar, size_t N, float extra_ratio=1.0f) {
-    size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    float absmax = 0.0f;
+    size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size * ABSMAX_OUTER_LOOP;
+    uint absmax_uint = 0;
 
     if (idx < N) {
-        x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
-        for(int k = 0; k < packed_inp.size; ++k) {
-            float x = (float)packed_inp[k];
-            absmax = max(absmax, abs(x));
+        #pragma unroll
+        for (int i = 0; i < ABSMAX_OUTER_LOOP; i++) {
+            x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
+            for(int k = 0; k < packed_inp.size; ++k) {
+                uint x = __float_as_uint((float)packed_inp[k] * extra_ratio) & 0x7f800000;
+                absmax_uint = max(absmax_uint, x);
+            }
+            idx += x128::size;
         }
     }
-    absmax = blockReduce<warpReduceMax>(absmax);
+    // Use inline PTX for redux.sync.max.u32
+    uint lane_id = threadIdx.x % 32;
+    uint warp_id = threadIdx.x / 32;
 
-    if (threadIdx.x == 0) {
-        absmax = powf(2.0f, floorf(log2f(absmax))); // Round to previous power of 2
-        atomicMax((unsigned int*)absmax_scalar, __float_as_uint(absmax * extra_ratio));
+    asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
+    __shared__ uint tmp[32];
+    if (lane_id == 0) {
+        tmp[warp_id] = absmax_uint;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        absmax_uint = tmp[lane_id];
+        atomicMax((unsigned int*)absmax_scalar, absmax_uint);
     }
 }
 
@@ -147,11 +164,8 @@ template <typename T>
 void get_absmax(const T* inp, float* absmax_scalar, bool memset, int N, float extra_ratio=1.0f, cudaStream_t stream=0) {
     NVTX_RANGE_FN();
     int block_size = 1024;
-    assert((N % x128::size) == 0);
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
-
-    // printf grid_size
-    //printf("grid_size: %d, block_size: %d, N: %d\n", grid_size, block_size, N);
+    assert((N % (x128::size * ABSMAX_OUTER_LOOP)) == 0);
+    const int grid_size = CEIL_DIV(N, block_size * x128::size * ABSMAX_OUTER_LOOP);
 
     if (memset) {
         cudaMemset(absmax_scalar, 0, sizeof(float));
@@ -160,49 +174,78 @@ void get_absmax(const T* inp, float* absmax_scalar, bool memset, int N, float ex
     cudaCheck(cudaGetLastError());
 }
 
-__global__ void scale_tensor_kernel(floatX* out, const floatX* inp, float* scaleptr, bool reciprocal) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+#define SCALE_OUTER_LOOP 2
+
+__global__ void scale_tensor_kernel(__nv_fp8_e4m3* out, const floatX* inp, float* scaleptr, bool reciprocal) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size * SCALE_OUTER_LOOP;
 
     float scale = *scaleptr;
     if(reciprocal) {
         scale = 1.0f / scale;
     }
 
-    x128 packed_out;
-    x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
-    for(int k = 0; k < packed_inp.size; ++k) {
-        float x = (float)packed_inp[k];
-        packed_out[k] = (floatX)(x * scale);
+    constexpr int iter_per_fp8 = e4m3_128::size / x128::size;
+    constexpr int iter_outer = SCALE_OUTER_LOOP / iter_per_fp8;
+    #pragma unroll iter_outer
+    for (int o = 0; o < iter_outer; o++) {
+        e4m3_128 packed_out;
+        #pragma unroll iter_per_fp8
+        for (int i = 0; i < iter_per_fp8; i++) {
+            x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
+            #pragma unroll x128::size
+            for(int k = 0; k < x128::size; ++k) {
+                float x = (float)packed_inp[k];
+                packed_out[k + i*x128::size] = (__nv_fp8_e4m3)(x * scale);
+            }
+            idx += x128::size;
+        }
+        store128(out + (idx - e4m3_128::size), packed_out);
     }
-    store128(out + idx, packed_out);
+}
+
+__global__ void scale_tensor_kernel(floatX* out, const floatX* inp, float* scaleptr, bool reciprocal) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size * SCALE_OUTER_LOOP;
+
+    float scale = *scaleptr;
+    if(reciprocal) {
+        scale = 1.0f / scale;
+    }
+
+    for (int i = 0; i < SCALE_OUTER_LOOP; i++) {
+        x128 packed_out;
+        x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
+        for(int k = 0; k < packed_inp.size; ++k) {
+            float x = (float)packed_inp[k];
+            packed_out[k] = (floatX)(x * scale);
+        }
+        store128(out + idx, packed_out);
+    }
 }
 
 template <typename T>
 __global__ void scale_tensor_kernel(T* out, const floatX* inp, float* scaleptr, bool reciprocal) {
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size * SCALE_OUTER_LOOP;
 
     float scale = *scaleptr;
     if(reciprocal) {
         scale = 1.0f / scale;
     }
 
-    //if (scale == 3.34534556f) {
-    //    out[idx] = (T)3.5f;
-    //}
-
-    x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
-    for(int k = 0; k < packed_inp.size; ++k) {
-        float x = (float)packed_inp[k];
-        out[idx + k] = (T)(x * scale);
+    for (int i = 0; i < SCALE_OUTER_LOOP; i++, idx += x128::size) {
+        x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
+        for(int k = 0; k < packed_inp.size; ++k) {
+            float x = (float)packed_inp[k];
+            out[idx + k] = (T)(x * scale);
+        }
     }
 }
 
 template <typename T>
 void scale_tensor(T* out, const floatX* inp, float* scaleptr, bool reciprocal, int N, cudaStream_t stream) {
     NVTX_RANGE_FN();
-    const int block_size = 128;
-    assert(N % (block_size * x128::size) == 0);
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
+    const int block_size = 64;
+    assert(N % (block_size * x128::size * SCALE_OUTER_LOOP) == 0);
+    const int grid_size = CEIL_DIV(N, block_size * x128::size * SCALE_OUTER_LOOP);
 
     generate_analysis(inp, N, "pre_scale_tensor");
     scale_tensor_kernel<<<grid_size, block_size, 0, stream>>>(out, inp, scaleptr, reciprocal);
@@ -210,18 +253,16 @@ void scale_tensor(T* out, const floatX* inp, float* scaleptr, bool reciprocal, i
     generate_analysis(out, N, "post_scale_tensor");
 }
 
-//#define FORCE_FP8_MATMUL
+#define FORCE_FP8_MATMUL
 
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* bias,
                      int m, int n, int k, cudaStream_t stream, bool transA=true, bool transB=false,
                      int batch_count=0, size_t strideA=0, size_t strideB=0, size_t strideOut=0,
-                     bool accumulate=false, floatX* pre_gelu=NULL, bool backward=false) {
+                     bool accumulate=false, floatX* pre_gelu=NULL, bool backward=false, bool allow_fp8=true) {
     NVTX_RANGE_FN();
     bool has_bias = (bias != NULL);
     bool has_gelu = (pre_gelu != NULL);
-
-    has_bias = false;
 
     // check alignments for all pointers (only need 16 bytes alignment in some modes but it never hurts to be aligned perf-wise!)
     if(((uintptr_t)a % 16) != 0 || ((uintptr_t)b % 16) != 0 || ((uintptr_t)d % 16) != 0 || ((uintptr_t)bias % 16) != 0) {
@@ -244,7 +285,7 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 
     auto input_precision = CUBLAS_LOWP;
     #ifdef FORCE_FP8_MATMUL
-    if (transA && !transB && batch_count == 0) {
+    if (transA && !transB && batch_count == 0 && allow_fp8) {
         input_precision = CUDA_R_8F_E4M3;
         int8_t fast_accum = 1;
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum, sizeof(fast_accum)));
@@ -258,8 +299,14 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
         // Get absmax for a and b
         float* absmax_a = &((float*)huge_scratch)[0];
         float* absmax_b = &((float*)huge_scratch)[1];
-        get_absmax(a, absmax_a, true, m*k/8, 1.0/128.0f, stream);
+        __nv_fp8_e4m3* a_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[256];
+        __nv_fp8_e4m3* b_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[256+m*k];
+
         get_absmax(b, absmax_b, true, k*n/8, 1.0/128.0f, stream);
+        scale_tensor<__nv_fp8_e4m3>(b_fp8, b, absmax_b, true, k*n, stream);
+
+        get_absmax(a, absmax_a, true, m*k/8, 1.0/128.0f, stream);
+        scale_tensor<__nv_fp8_e4m3>(a_fp8, a, absmax_a, true, m*k, stream);
 
         /*
         cudaStreamSynchronize(stream);
@@ -269,13 +316,6 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
         printf("absmax_a: %f, absmax_b: %f\n", absmax_a_host, absmax_b_host);
         */
 
-        // Convert a and b to FP8
-        __nv_fp8_e4m3* a_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[256];
-        __nv_fp8_e4m3* b_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[256+m*k];
-
-        //int count = batch_count ? batch_count : 1;
-        scale_tensor<__nv_fp8_e4m3>(a_fp8, a, absmax_a, true, m*k, stream);
-        scale_tensor<__nv_fp8_e4m3>(b_fp8, b, absmax_b, true, k*n, stream);
 
         // get absmax of a_fp8
         /*
@@ -412,10 +452,10 @@ void matmul_forward_cublaslt(floatX* out,
 
     // Only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (???)
     if (deviceProp.major < 9 && pre_gelu) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL);
+        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false, true);
         gelu_forward(out, pre_gelu, B*T*OC, stream);
     } else {
-        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu);
+        matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false, true);
         if (pre_gelu) {
             generate_analysis(pre_gelu, OC*B*T, "matmul_fwd_act_pre_gelu");
         }
