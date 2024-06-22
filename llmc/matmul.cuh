@@ -210,7 +210,7 @@ void scale_tensor(T* out, const floatX* inp, float* scaleptr, bool reciprocal, i
     generate_analysis(out, N, "post_scale_tensor");
 }
 
-#define FORCE_FP8_MATMUL
+//#define FORCE_FP8_MATMUL
 
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* bias,
@@ -258,8 +258,8 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
         // Get absmax for a and b
         float* absmax_a = &((float*)huge_scratch)[0];
         float* absmax_b = &((float*)huge_scratch)[1];
-        //get_absmax(a, absmax_a, true, m*k/8, 1.0/128.0f, stream);
-        //get_absmax(b, absmax_b, true, k*n/8, 1.0/128.0f, stream);
+        get_absmax(a, absmax_a, true, m*k/8, 1.0/128.0f, stream);
+        get_absmax(b, absmax_b, true, k*n/8, 1.0/128.0f, stream);
 
         /*
         cudaStreamSynchronize(stream);
