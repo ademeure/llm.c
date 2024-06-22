@@ -400,6 +400,8 @@ __global__ void analysis_variance_kernel(unsigned int* analysis_gmem, const T* i
 }
 
 __host__ void reset_analysis() {
+    return;
+
     for (int h = 0; h < current_analysis && h < MAX_ANALYSIS_STATS; h++) {
         free(analysis_names[h]);
         analysis_names[h] = NULL;

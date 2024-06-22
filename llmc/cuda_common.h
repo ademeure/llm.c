@@ -87,10 +87,12 @@ typedef __nv_bfloat16 floatX;
 
 // Declare FP8 stcs/ldcs wrappers as they do not exist by default in CUDA
 // TODO: Maybe not required if floatX is declared as __nv_fp8_storage_t, and we explicitly convert everywhere?
+/*
 __device__ void __stcs(__nv_fp8_e4m3 *ptr, __nv_fp8_e4m3 value) { __stcs((__nv_fp8_storage_t*)ptr, value.__x); }
 __device__ void __stcs(__nv_fp8_e5m2 *ptr, __nv_fp8_e5m2 value) { __stcs((__nv_fp8_storage_t*)ptr, value.__x); }
 __device__ __nv_fp8_e4m3 __ldcs(const __nv_fp8_e4m3 *ptr) { __nv_fp8_storage_t value = __ldcs((__nv_fp8_storage_t*)ptr); return *reinterpret_cast<__nv_fp8_e4m3*>(&value); }
 __device__ __nv_fp8_e5m2 __ldcs(const __nv_fp8_e5m2 *ptr) { __nv_fp8_storage_t value = __ldcs((__nv_fp8_storage_t*)ptr); return *reinterpret_cast<__nv_fp8_e5m2*>(&value); }
+*/
 
 // ----------------------------------------------------------------------------
 // Load and store with streaming cache hints

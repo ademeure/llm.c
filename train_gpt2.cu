@@ -6,7 +6,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #ifdef ENABLE_FP32
 constexpr float LOSS_SCALING_FACTOR = 1.0f;
 #else
-constexpr float LOSS_SCALING_FACTOR = (float)(1<<10);
+constexpr float LOSS_SCALING_FACTOR = (float)(1<<19);
 #endif
 
 // todo where to put this, really should NOT be here, or hardcoded, or...
@@ -30,6 +30,8 @@ uint global_current_layer = 0;
 uint global_current_step = 0;
 uint global_current_micro_step = 0;
 
+float* huge_scratch = NULL;
+size_t huge_scratch_size = 0;
 
 #include <unistd.h>
 #include <stdio.h>
@@ -204,7 +206,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     }
     // malloc all parameters all at once on the device
     void* params_memory;
-    cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
+    cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes * 1.1));
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
@@ -299,7 +301,7 @@ void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
         num_activations += act_sizes[i];
     }
     void* acts_memory;
-    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(floatX)));
+    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * 1.1 * sizeof(floatX)));
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < n; i++) {
         // extra protection so we don't accidentally use an empty buffer
@@ -553,9 +555,16 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
                     n = n / L;
                     layer_offset = l * n;
                 }
-                // in GPT-2, the projections back into the residual stream are additionally
-                // scaled by 1/sqrt(2*L) for training stability
-                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+
+                float scale = 1.0f/sqrtf(channels);
+                if (i == 10) {
+                    scale *= 1.701;
+                } else if (i == 6 || i == 12) {
+                    // in GPT-2, the projections back into the residual stream are additionally
+                    // scaled by 1/sqrt(2*L) for training stability
+                    //scale *= residual_scale;
+                }
+
                 // okay let's draw the random numbers and write them
                 float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
                 normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
@@ -604,6 +613,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
+            printf("act_sizes[%d] = %lu ==> %lu\n", (int)i, (int)model->act_sizes[i], (int)model->act_sizes[i] * sizeof(floatX));
         }
         model->num_activations = num_activations;
         printf0("allocating %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
@@ -613,6 +623,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(floatX)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses_fp32, B * T * sizeof(float)));
+
+        huge_scratch_size = max(4*C*C, B*T*4*C);
+        huge_scratch_size = max(huge_scratch_size, (size_t)1024*1024*1024);
+        cudaCheck(cudaMalloc((void**)&huge_scratch, huge_scratch_size * sizeof(float)));
+        cudaCheck(cudaMemset(huge_scratch, 0, huge_scratch_size * sizeof(float)));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -846,7 +861,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_fch_pre_gelu = acts.fch + l * B * T * 4*C;
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
@@ -858,10 +873,9 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
         if(model->recompute >= 1) {
             // recompute >= 1 means we recompute gelu. in this case,
             // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream, true);
+            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream, true);
         }
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream);
-        gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C, main_stream);
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu);
         if(model->recompute >= 2) {
             // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
@@ -878,7 +892,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
-        floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
+        floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
         if(model->recompute >= 2) {
@@ -1034,8 +1048,8 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     if(!isfinite(grad_norm_squared_cpu)) {
         // may happen due to some issue (e.g. overflow?)
         // TODO: later may want to keep a global counter of instabilities like this
-        printf0("[WARNING]: grad norm is not finite, skipping AdamW update\n");
-        return -1.0f;
+        //printf0("[WARNING]: grad norm is not finite, skipping AdamW update\n");
+        //return -1.0f;
     }
     float grad_norm_cpu = sqrtf(grad_norm_squared_cpu);
     float grad_scale = (grad_norm_cpu > grad_clip) ? grad_clip / grad_norm_cpu : 1.0f;
@@ -1142,6 +1156,7 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->acts_memory);
     cudaFreeCheck(&model->inputs);
     cudaFreeCheck(&model->targets);
+    cudaFreeCheck(&huge_scratch);
     cudaCheck(cudaFreeHost(model->cpu_losses));
     cudaCheck(cudaFreeHost(model->cpu_losses_fp32));
     free(model->workload_indices);
