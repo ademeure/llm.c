@@ -174,6 +174,12 @@ __device__ inline T blockReduce(T val, bool final_sync=true, T out_of_bounds=0) 
     return block_val;
 }
 
+template<float (*warp_reduction)(float)>
+__device__ inline float blockReduce(float val, bool final_sync=true, float out_of_bounds=0) {
+    return blockReduce<float, warp_reduction>(val, final_sync, out_of_bounds);
+}
+
+
 // ----------------------------------------------------------------------------
 // Random Number Generation used in Stochastic Rounding
 
@@ -337,8 +343,8 @@ __global__ void analysis_kernel(uint* analysis_gmem, const T* input, size_t n) {
             atomicAdd(analysis_gmem + STATS_DETAILED_HISTOGRAM + i, increment);
         }
     }
-    absmin = blockReduce<float, warpReduceMin>(absmin);
-    absmax = blockReduce<float, warpReduceMax>(absmax);
+    absmin = blockReduce<warpReduceMin>(absmin);
+    absmax = blockReduce<warpReduceMax>(absmax);
     maxexp = blockReduce<uint, warpReduceMax>(maxexp);
     minexp = blockReduce<uint, warpReduceMin>(minexp);
     zeros  = blockReduce<uint, warpReduceSum>(zeros);
@@ -346,7 +352,7 @@ __global__ void analysis_kernel(uint* analysis_gmem, const T* input, size_t n) {
     posval = blockReduce<uint, warpReduceSum>(posval);
     inf    = blockReduce<uint, warpReduceSum>(inf);
     nan    = blockReduce<uint, warpReduceSum>(nan);
-    sum    = blockReduce<float, warpReduceSum>(sum);
+    sum    = blockReduce<warpReduceSum>(sum);
 
     if(threadIdx.x == 0) {
         // Replace absmin/minexp by maximum values if they are still at the initial memset of 0
@@ -391,7 +397,7 @@ __global__ void analysis_variance_kernel(unsigned int* analysis_gmem, const T* i
     }
 
     // Block reduction
-    variance = blockReduce<float, warpReduceSum>(variance);
+    variance = blockReduce<warpReduceSum>(variance);
 
     // Global memory atomic add
     if(threadIdx.x == 0) {

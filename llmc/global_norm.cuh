@@ -21,7 +21,7 @@ __device__ float global_norm_squared_for_range(const T* data, size_t count) {
         accumulator += scaled_data * scaled_data;
     }
     // block-level reduce
-    return blockReduce<float, warpReduceSum>(accumulator);
+    return blockReduce<warpReduceSum>(accumulator);
 }
 
 template<class T>
@@ -40,7 +40,7 @@ __global__ void global_norm_aggregate_kernel(float* out, size_t grid_size) {
     size_t index = threadIdx.x;
     // grab block sums from the previous kernel, use 0. as the neutral sum element
     float block_sum = (index < grid_size) ? out[index] : 0.f;
-    float sum = blockReduce<float, warpReduceSum>(block_sum);
+    float sum = blockReduce<warpReduceSum>(block_sum);
     if(threadIdx.x == 0) {
         out[0] = sum;  // out[0] ends up with the final norm squared
     }

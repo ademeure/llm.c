@@ -116,7 +116,7 @@ __global__ void get_absmax_kernel(const T* inp, float* absmax_scalar, size_t N, 
             absmax = max(absmax, abs(x));
         }
     }
-    absmax = blockReduce<float, warpReduceMax>(absmax);
+    absmax = blockReduce<warpReduceMax>(absmax);
 
     if (threadIdx.x == 0) {
         absmax = powf(2.0f, floorf(log2f(absmax))); // Round to previous power of 2
@@ -135,7 +135,7 @@ __global__ void get_absmax_kernel(const floatX* inp, float* absmax_scalar, size_
             absmax = max(absmax, abs(x));
         }
     }
-    absmax = blockReduce<float, warpReduceMax>(absmax);
+    absmax = blockReduce<warpReduceMax>(absmax);
 
     if (threadIdx.x == 0) {
         absmax = powf(2.0f, floorf(log2f(absmax))); // Round to previous power of 2

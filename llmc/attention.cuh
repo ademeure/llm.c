@@ -173,7 +173,7 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
             local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
         }
 
-        local_sum = blockReduce<float, warpReduceSum>(local_sum);
+        local_sum = blockReduce<warpReduceSum>(local_sum);
 
         for (int t3 = threadIdx.x; t3 < T; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
