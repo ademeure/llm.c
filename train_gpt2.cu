@@ -208,7 +208,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     }
     // malloc all parameters all at once on the device
     void* params_memory;
-    cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes * 1.1));
+    cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
@@ -303,7 +303,7 @@ void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
         num_activations += act_sizes[i];
     }
     void* acts_memory;
-    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * 1.1 * sizeof(floatX)));
+    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(floatX)));
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < n; i++) {
         // extra protection so we don't accidentally use an empty buffer
@@ -627,7 +627,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses_fp32, B * T * sizeof(float)));
 
         huge_scratch_size = max(4*C*C, B*T*4*C);
-        huge_scratch_size = max(huge_scratch_size, (size_t)1024*1024*1024);
+        huge_scratch_size = max(huge_scratch_size, (size_t)256*1024*1024);
         cudaCheck(cudaMalloc((void**)&huge_scratch, huge_scratch_size * sizeof(float)));
         cudaCheck(cudaMemset(huge_scratch, 0, huge_scratch_size * sizeof(float)));
     } else {
