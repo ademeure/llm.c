@@ -285,7 +285,12 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[4] = TENSOR_SPEC(data->atty, L * B * T * C);
     #ifdef ENABLE_CUDNN
     // FP32 stats tensor for cuDNN to be passed to backward pass
-    tensors[5] = TENSOR_SPEC(data->att, L * B * NH * T);
+    act_sizes[5] = L * B * NH * T * (sizeof(float) / sizeof(floatX));
+#ifdef ENABLE_FP8
+    // FP8 scale/descale tensors etc.
+    // todo - not currently used until proper cuDNN FP8 support is there
+    act_sizes[5] += L * 32 * (sizeof(float) / sizeof(floatX));
+#endif
     #else
     tensors[5] = TENSOR_SPEC(data->att, L * B * NH * T * T);
     #endif
@@ -671,7 +676,10 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         // now do the forward pass
         #ifdef ENABLE_CUDNN
-        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
+        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor for stats
+    #ifdef ENABLE_FP8
+        l_att += L * 32; // include space for the FP8 scale/descale tensors of every layer
+    #endif
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
