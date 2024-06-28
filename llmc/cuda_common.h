@@ -15,6 +15,7 @@ Common utilities for CUDA code.
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include "utils.h"
 
@@ -75,7 +76,8 @@ inline void cudaFreeCheck(T** ptr, const char *file, int line) {
 enum PrecisionMode {
     PRECISION_FP32,
     PRECISION_FP16,
-    PRECISION_BF16
+    PRECISION_BF16,
+    PRECISION_FP8
 };
 
 // Specific configurations based on the enabled precision
@@ -86,6 +88,9 @@ typedef float floatX;
 #elif defined(ENABLE_FP16)
 typedef half floatX;
 #define PRECISION_MODE PRECISION_FP16
+#elif defined(ENABLE_FP8)
+typedef __nv_fp8_e4m3 floatX;
+#define PRECISION_MODE PRECISION_FP8
 #else // Default to bfloat16
 typedef __nv_bfloat16 floatX;
 #define PRECISION_MODE PRECISION_BF16
@@ -107,6 +112,14 @@ __device__ floatX __ldcs(const floatX* address) {
 __device__ void __stcs(floatX* address, floatX value) {
     __stcs(reinterpret_cast<unsigned short*>(address), ((__nv_bfloat16_raw)value).x);
 }
+#endif
+
+// Declare FP8 e4m3/e5m2 stcs/ldcs wrappers as they do not exist by default in CUDA (only __nv_fp8_storage_t which is unsigned char)
+#if defined(ENABLE_FP8) && !defined(CUDNN_CPP)
+__device__ void __stcs(__nv_fp8_e4m3 *ptr, __nv_fp8_e4m3 value) { __stcs((unsigned char*)ptr, value.__x); }
+__device__ void __stcs(__nv_fp8_e5m2 *ptr, __nv_fp8_e5m2 value) { __stcs((unsigned char*)ptr, value.__x); }
+__device__ __nv_fp8_e4m3 __ldcs(const __nv_fp8_e4m3 *ptr) { unsigned char value = __ldcs((unsigned char*)ptr); return *reinterpret_cast<__nv_fp8_e4m3*>(&value); }
+__device__ __nv_fp8_e5m2 __ldcs(const __nv_fp8_e5m2 *ptr) { unsigned char value = __ldcs((unsigned char*)ptr); return *reinterpret_cast<__nv_fp8_e5m2*>(&value); }
 #endif
 
 // ----------------------------------------------------------------------------

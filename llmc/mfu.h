@@ -9,6 +9,7 @@
 #define MFUH_PRECISION_FP32 0
 #define MFUH_PRECISION_FP16 1
 #define MFUH_PRECISION_BF16 2
+#define MFUH_PRECISION_FP8  3
 
 typedef struct {
     float TF_32;       // tensor-core performance 32 bit
@@ -100,7 +101,8 @@ float get_flops_promised(const char* device, int precision_mode) {
     */
 
    // validate the precision mode as one of the three possible values
-    if (!(precision_mode == MFUH_PRECISION_FP32 || precision_mode == MFUH_PRECISION_FP16 || precision_mode == MFUH_PRECISION_BF16)) {
+    if (!(precision_mode == MFUH_PRECISION_FP32 || precision_mode == MFUH_PRECISION_FP16 ||
+          precision_mode == MFUH_PRECISION_BF16) || precision_mode == MFUH_PRECISION_FP8) {
         fprintf(stderr, "Invalid precision mode: %d\n", precision_mode);
         return -1.0f;
     }
@@ -116,6 +118,7 @@ float get_flops_promised(const char* device, int precision_mode) {
             if (precision_mode == MFUH_PRECISION_BF16) { value = perf_data->BF_16_32; }
             if (precision_mode == MFUH_PRECISION_FP32) { value = perf_data->TF_32; }
             if (precision_mode == MFUH_PRECISION_FP16) { value = perf_data->FP_16_32; }
+            if (precision_mode == MFUH_PRECISION_FP8) { value = perf_data->FP_8_32; }
 
             // we'd get here if we're e.g. trying to use BF16 on Volta GPU or something...
             if (value < 0.0f) {

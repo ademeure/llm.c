@@ -74,7 +74,7 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
             if constexpr (!UseAuxBuffer) {
                 dbias[global_oc + k] = (OutFloat)(a + (float)dbias[global_oc + k]);
             } else {
-                dbias[global_oc + k + blockIdx.y * OC] = a;
+                dbias[global_oc + k + blockIdx.y * OC] = (OutFloat)a;
             }
         }
     }
@@ -128,6 +128,13 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     int returnedResults = 0;
     cublasLtMatmulPreference_t preference;
     cublasLtMatmulHeuristicResult_t heuristic;
+
+#if defined(ENABLE_FP8)
+    // todo - hack - just disable settings not supported in FP8 mode (not correct at all)
+    transA = true;
+    transB = false;
+    accumulate = false;
+#endif
 
     cublasOperation_t opNoTranspose = CUBLAS_OP_N;
     cublasOperation_t opTranspose = CUBLAS_OP_T;
@@ -205,7 +212,9 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
                                    preference, 1, &heuristic, &returnedResults);
     if (returnedResults == 0) {
-        printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k, has_bias);
+        printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d, sizeof(floatX): %lu, transA: %d, transB: %d, batch_count: %d, \
+                strideA: %lu, strideB: %lu, strideOut: %lu, accumulate: %d, pre_gelu: %p, backward: %d\n",
+                m, n, k, has_bias, sizeof(floatX), transA, transB, batch_count, strideA, strideB, strideOut, accumulate, pre_gelu, backward);
         exit(EXIT_FAILURE);
     }
 

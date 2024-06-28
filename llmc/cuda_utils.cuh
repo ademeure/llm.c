@@ -27,10 +27,10 @@ struct alignas(16) Packed128 {
         return result;
     }
     __device__ static Packed128 zeros() {
-        return constant(0.f);
+        return constant((ElementType)0.f);
     }
     __device__ static Packed128 ones() {
-        return constant(1.f);
+        return constant((ElementType)1.f);
     }
 
     __device__ ElementType& operator[](int index) {
@@ -101,6 +101,18 @@ __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
     return __bfloat162float(val);
 }
 
+#if defined(ENABLE_FP8)
+template<>
+__device__ float cast_value<float, __nv_fp8_e4m3>(__nv_fp8_e4m3 val) {
+    return float(val);
+}
+
+template<>
+__device__ float cast_value<float, __nv_fp8_e5m2>(__nv_fp8_e5m2 val) {
+    return float(val);
+}
+#endif
+
 template<typename Td, typename Ts>
 __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t stride_dst, ptrdiff_t stride_src) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -114,43 +126,60 @@ __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t
 // Warp/Block communication primitives
 
 // warp-level reduction for summing values
-__device__ inline float warpReduceSum(float val) {
+// warp-level reduction for summing values
+template <typename T=float>
+__device__ inline T warpReduceSum(T val) {
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
     }
     return val;
 }
-// warp-level reduction for finding the maximum value
-__device__ inline float warpReduceMax(float val) {
+// warp-level reduction for finding the minimum value
+template <typename T=float>
+__device__ inline T warpReduceMin(T val) {
     for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
+        T shuffled = __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        val = val < shuffled ? val : shuffled;
     }
     return val;
 }
+// warp-level reduction for finding the maximum value
+template <typename T=float>
+__device__ inline T warpReduceMax(T val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        T shuffled = __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        val = val > shuffled ? val : shuffled;
+    }
+    return val;
+}
+
 // requires all 32 threads in the warp to be active, but should work for any block size
 // uses non-dynamic shared memory so every call increases shared memory requirements by 128 bytes
 // the fact it's unique shared memory allows us to avoid an extra __syncthreads() call at the end
 // but if called inside a loop, the shared memory will be implicitly reused, so set final_sync to 1
-using reduction_func_t = float (*) (float);
-template<reduction_func_t warp_reduction>
-__device__ inline float blockReduce(float val, bool final_sync=false, float out_of_bounds=0.0f) {
+template<typename T=float, T (*warp_reduction)(T)>
+__device__ inline T blockReduce(T val, bool final_sync=true, T out_of_bounds=0) {
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
-    __shared__ float shared_val[WARP_SIZE];
+    __shared__ T shared_val[WARP_SIZE];
     const int lane_id = threadIdx.x % WARP_SIZE;
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int num_warps = blockDim.x / WARP_SIZE;
 
-    float warp_val = warp_reduction(val);
+    T warp_val = warp_reduction(val);
     if (lane_id == 0) { shared_val[warp_id] = warp_val; }
     __syncthreads();
     warp_val = (lane_id < num_warps) ? shared_val[lane_id] : out_of_bounds;
-    float block_val = warp_reduction(warp_val);
+    T block_val = warp_reduction(warp_val);
 
     if (final_sync) {
         __syncthreads(); // only needed in loops when effectively reusing shared memory etc.
     }
     return block_val;
+}
+template<float (*warp_reduction)(float)>
+__device__ inline float blockReduce(float val, bool final_sync=true, float out_of_bounds=0) {
+    return blockReduce<float, warp_reduction>(val, final_sync, out_of_bounds);
 }
 
 // Performs a _deterministic_ sum reduction. determinism is achieved by requiring that only
@@ -223,6 +252,29 @@ __device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out
     float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
     *out = __float2bfloat16_rn(__uint_as_float(float_bits));
 }
+#if defined(ENABLE_FP8)
+// WIP INEFFICIENT FP8
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e5m2 *out, unsigned int seed) {
+    // todo - is this stochastic rounding *too good*? can we cut any corners?
+    // makes sure each thread gets a different random number
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x001FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x001FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x001FFFFF) : (float_bits  & ~0x001FFFFF);
+    *out = __nv_fp8_e5m2(__uint_as_float(float_bits));
+}
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e4m3 *out, unsigned int seed) {
+    // todo - is this stochastic rounding *too good*? can we cut any corners?
+    // makes sure each thread gets a different random number
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x000FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x000FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x000FFFFF) : (float_bits  & ~0x000FFFFF);
+    *out = __nv_fp8_e4m3(__uint_as_float(float_bits));
+}
+#endif
 __device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigned int random) {
     *out = (float)in; // todo - implement this...
 }

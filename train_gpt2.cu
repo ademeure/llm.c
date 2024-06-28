@@ -541,7 +541,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
             // the layernorm parameters are all initialized to 1
             if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
                 for (size_t j = 0; j < model->param_elements[i]; j++) {
-                    params_memory_cpu[offset + j] = 1.0f;
+                    params_memory_cpu[offset + j] = (floatX)1.0f;
                 }
             }
             // weights tensors are handled here
@@ -1529,7 +1529,8 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
-                              : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
+                              : (PRECISION_MODE == PRECISION_FP16 ? "FP16" :
+                                (PRECISION_MODE == PRECISION_FP8 ? "FP8" : "BF16"));
     printf0("| device                | %-50s |\n", deviceProp.name);
     printf0("| peak TFlops           | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
     printf0("| precision             | %-50s |\n", precision_str);

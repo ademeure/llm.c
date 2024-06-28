@@ -177,7 +177,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
         const x128 in2 = load128cs(inp2 + c);
         x128 out;
         for(int k = 0; k < x128::size; ++k) {
-            out[k] = (float)in1[k] + (float)in2[k];
+            out[k] = (floatX)((float)in1[k] + (float)in2[k]);
             sum += (float)out[k];
         }
         store128cs(residual + c, out);
@@ -206,15 +206,15 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
         for(int k = 0; k < x128::size; ++k) {
             float n = s * ((float)res[k] - m); // normalized output
             float o = n * (float)w[k] + (float)b[k]; // scale and shift it
-            out[k] = o;
+            out[k] = (floatX)o;
         }
 
         store128cs(normed + c, out);
     }
     // cache the mean and rstd for the backward pass later
     if(threadIdx.x == 0) {
-        mean[idx] = m;
-        rstd[idx] = s;
+        mean[idx] = (floatX)m;
+        rstd[idx] = (floatX)s;
     }
 }
 
