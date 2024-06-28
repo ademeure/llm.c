@@ -102,7 +102,7 @@ float get_flops_promised(const char* device, int precision_mode) {
 
    // validate the precision mode as one of the three possible values
     if (!(precision_mode == MFUH_PRECISION_FP32 || precision_mode == MFUH_PRECISION_FP16 ||
-          precision_mode == MFUH_PRECISION_BF16) || precision_mode == MFUH_PRECISION_FP8) {
+          precision_mode == MFUH_PRECISION_BF16 || precision_mode == MFUH_PRECISION_FP8)) {
         fprintf(stderr, "Invalid precision mode: %d\n", precision_mode);
         return -1.0f;
     }
