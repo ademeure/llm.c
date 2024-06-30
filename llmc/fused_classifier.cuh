@@ -99,17 +99,18 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
         // it will be overwritten by the logits gradients which is when we reduce cache persistence
         x128 packed_logits_vec = load128(logits_vec + i * x128::size); // rely on cs of store128cs
         x128 packed_probs;
+        g128 packed_dlogits_vec;
         for(int k = 0; k < x128::size; ++k) {
             int element = i*x128::size + k;
             float prob = expf((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
             packed_probs[k] = (floatX)prob;
             float indicator = (element == ix) ? 1.0f : 0.0f;
-            packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
+            packed_dlogits_vec[k] = (floatG)((prob - indicator) * dloss); // todo8 - scaling
         }
         if (WriteDLogits){
             // reduce cache persistence for the overwritten logits
             // to maximise probability that logits remain in cache between prepare_softmax and here
-            store128cs(logits + idx * P + i * x128::size, packed_logits_vec);
+            store128cs((floatG*)logits + idx * P + i * g128::size, packed_dlogits_vec); // todo8 - scaling
         }
         if (WriteProbs) {
             store128(probs + idx * P + i * x128::size, packed_probs);
@@ -124,7 +125,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss;
         if (WriteDLogits){
-            __stcs(logits + idx * P + i, (floatX)dlogit);
+            __stcs((floatG*)logits + idx * P + i, (floatG)dlogit); // todo8 - scaling
         }
         if (WriteProbs) {
             probs[idx * P + i] = (floatX)prob;

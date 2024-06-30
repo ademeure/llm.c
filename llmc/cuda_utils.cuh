@@ -78,6 +78,11 @@ __device__ void store128cg(ElementType* target, Packed128<ElementType> value) {
 // short-form typedefs
 typedef Packed128<float> f128;
 typedef Packed128<floatX> x128;
+typedef Packed128<floatW> w128;
+typedef Packed128<floatG> g128;
+typedef Packed128<floatX16> x16x128;
+constexpr size_t x_to_x16_ratio = x128::size / x16x128::size;
+constexpr size_t x_to_w_ratio = x128::size / w128::size;
 
 // ----------------------------------------------------------------------------
 // Copy, cast functions

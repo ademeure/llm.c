@@ -10,11 +10,13 @@ Matrix Multiplication, with help from cuBLASLt
 // GELU can be either fused (cublasLt) or non-fused (gelu.h)
 #include "gelu.cuh"
 
+#include <typeinfo> // Add this line at the beginning of your file
+
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
 template<typename OutFloat, bool UseAuxBuffer>
-__global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout, int B, int T, int OC,
+__global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatG* dout, int B, int T, int OC,
                                              std::bool_constant<UseAuxBuffer>) {
     constexpr const int bdx = 4;
     constexpr const int bdy = WARP_SIZE / bdx;
@@ -25,33 +27,33 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
     int warp_c = (int)threadIdx.y;
     int block_d = (int)threadIdx.z;
 
-    const int OC_per_warp = bdy * x128::size;  // 64 at BF16
+    const int OC_per_warp = bdy * g128::size;  // 64 at BF16
 
-    int local_oc = warp_c * x128::size;
+    int local_oc = warp_c * g128::size;
     int global_oc = blockIdx.x * OC_per_warp + local_oc;
 
     int local_bt = warp_d + bdx * block_d;
     int bt_per_block = bdx * blockDim.z;
 
-    float accumulators[x128::size];
-    for (int k = 0; k < x128::size; k++) {
+    float accumulators[g128::size];
+    for (int k = 0; k < g128::size; k++) {
         accumulators[k] = 0.0f;
     }
 
     if(global_oc < OC) {
         // sum up over all bt within registers
         for (int idx = blockIdx.y * bt_per_block + local_bt; idx < B * T; idx += gridDim.y * bt_per_block) {
-            x128 packed_dout = load128(dout + global_oc + idx*OC);
-            for (int k = 0; k < x128::size; k++) {
+            g128 packed_dout = load128(dout + global_oc + idx*OC);
+            for (int k = 0; k < packed_dout.size; k++) {
                 accumulators[k] += (float)packed_dout[k];
             }
         }
     }
 
-    __shared__ float sub_results[x128::size][WARP_SIZE][bdy];
+    __shared__ float sub_results[g128::size][WARP_SIZE][bdy];
 
     // reduce within-warp results
-    for (int k = 0; k < x128::size; k++) {
+    for (int k = 0; k < g128::size; k++) {
         float v = accumulators[k];
         v += __shfl_down_sync(0xffffffff, v, 1, 4);
         v += __shfl_down_sync(0xffffffff, v, 2, 4);
@@ -62,7 +64,7 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
     __syncthreads();
 
     // block-wide reductions
-    for (int k = block_d; k < x128::size; k += blockDim.z) {
+    for (int k = block_d; k < g128::size; k += blockDim.z) {
         float a = 0.f;
         for (int r = warp_d; r < blockDim.z; r += bdx) {
             float v = sub_results[k][r][warp_c];
@@ -80,9 +82,10 @@ __global__ void matmul_backward_bias_kernel9(OutFloat* dbias, const floatX* dout
     }
 }
 
-__global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, size_t m) {
+template <typename T=floatX>
+__global__ void reduce_add_sum_kernel(T* dst, const float* src, size_t n, size_t m) {
     const size_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * f128::size;
-    assert(n % x128::size == 0);
+    assert(n % f128::size == 0);
     if (idx < n) {
         f128 acc;
         for(int k = 0; k < f128::size; ++k) {
@@ -96,7 +99,7 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
             }
         }
         for(int k = 0; k < f128::size; ++k) {
-            dst[idx + k] = (floatX) ((float)dst[idx + k] + acc[k]);
+            dst[idx + k] = (T) ((float)dst[idx + k] + acc[k]);
         }
     }
 }
@@ -106,10 +109,11 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 
 // Wrapper around cublasLtMatmul that is meant to support everything we need in llm.c
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
-void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* bias,
+template <typename typeA=floatX, typename typeB=floatX, typename typeD=floatX>
+void matmul_cublaslt(typeD* d, const typeA* a, const typeB* b, const void* bias,
                      int m, int n, int k, cudaStream_t stream=0, bool transA=true, bool transB=false,
                      int batch_count=0, size_t strideA=0, size_t strideB=0, size_t strideOut=0,
-                     bool accumulate=false, floatX* pre_gelu=NULL, bool backward=false)
+                     bool accumulate=false, void* pre_gelu=NULL, bool backward=false)
 {
     NVTX_RANGE_FN();
     bool has_bias = (bias != NULL);
@@ -129,11 +133,53 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     cublasLtMatmulPreference_t preference;
     cublasLtMatmulHeuristicResult_t heuristic;
 
+    cudaDataType BiasType = CUBLAS_LOWP;
+    cudaDataType AType = CUBLAS_LOWP;
+    cudaDataType BType = CUBLAS_LOWP;
+    cudaDataType CType = CUBLAS_LOWP;
+    cudaDataType DType = CUBLAS_LOWP;
+
 #if defined(ENABLE_FP8)
     // todo - hack - just disable settings not supported in FP8 mode (not correct at all)
     transA = true;
     transB = false;
+    if (accumulate) {
+        if constexpr (std::is_same_v<typeD, nv_bfloat16> == false) {
+            assert(false);
+        }
+    }
     accumulate = false;
+
+    BiasType = CUDA_R_16BF;
+    CType = CUDA_R_16BF;
+    if constexpr (std::is_same_v<typeD, __nv_fp8_e4m3>) {
+        DType = CUDA_R_8F_E4M3;
+    } else if constexpr (std::is_same_v<typeD, __nv_fp8_e5m2>) {
+        DType = CUDA_R_8F_E5M2;
+    } else if constexpr (std::is_same_v<typeD, nv_bfloat16>) {
+        DType = CUDA_R_16BF;
+    } else {
+        // todo - do we need automatic conversion for other formats?
+        assert(false);
+    }
+    if constexpr (std::is_same_v<typeA, __nv_fp8_e4m3>) {
+        AType = CUDA_R_8F_E4M3;
+    } else if constexpr (std::is_same_v<typeA, __nv_fp8_e5m2>) {
+        AType = CUDA_R_8F_E5M2;
+    } else {
+        // TODO!!!
+        // todo - cast BF16 to FP8
+        return;
+        assert(false);
+    }
+    if constexpr (std::is_same_v<typeB, __nv_fp8_e4m3>) {
+        BType = CUDA_R_8F_E4M3;
+    } else if constexpr (std::is_same_v<typeB, __nv_fp8_e5m2>) {
+        BType = CUDA_R_8F_E5M2;
+    } else {
+        // todo - cast BF16 to FP8
+        assert(false);
+    }
 #endif
 
     cublasOperation_t opNoTranspose = CUBLAS_OP_N;
@@ -147,18 +193,18 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     cublasLtMatrixLayout_t DLayout;
     cublasLtMatrixLayout_t CLayout;
     if (transA) {
-        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, CUBLAS_LOWP, k, m, k));
+        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, AType, k, m, k));
     } else {
-        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, CUBLAS_LOWP, m, k, m));
+        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, AType, m, k, m));
     }
     if (transB) {
-        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, CUBLAS_LOWP, n, k, n));
+        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, BType, n, k, n));
     } else {
-        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, CUBLAS_LOWP, k, n, k));
+        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, BType, k, n, k));
     }
     // cuBLASLt requires C in FP8 mode to be BF16 or FP32... (sigh)
-    cublasCheck(cublasLtMatrixLayoutCreate(&CLayout, (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP, m, n, m));
-    cublasCheck(cublasLtMatrixLayoutCreate(&DLayout, CUBLAS_LOWP, m, n, m));
+    cublasCheck(cublasLtMatrixLayoutCreate(&CLayout, CType, m, n, m));
+    cublasCheck(cublasLtMatrixLayoutCreate(&DLayout, DType, m, n, m));
 
     // Strided Batched GEMM (used for non-flash attention, equivalent to cublasGemmStridedBatchedEx)
     if (batch_count) {
@@ -199,8 +245,7 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 
     if (has_bias) {
         // cuBLASLt requires bias in FP8 mode to be BF16... (sigh)
-        cublasDataType_t bias_data_type = (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP; // force BF16 bias for FP8 mode
-        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_data_type, sizeof(bias_data_type)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &BiasType, sizeof(BiasType)));
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
     }
 
@@ -216,6 +261,21 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
                 strideA: %lu, strideB: %lu, strideOut: %lu, accumulate: %d, pre_gelu: %p, backward: %d\n",
                 m, n, k, has_bias, sizeof(floatX), transA, transB, batch_count, strideA, strideB, strideOut, accumulate, pre_gelu, backward);
         exit(EXIT_FAILURE);
+    } else {
+        /*
+        printf("Found cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d, sizeof(floatX): %lu, transA: %d, transB: %d, batch_count: %d, \
+                strideA: %lu, strideB: %lu, strideOut: %lu, accumulate: %d, pre_gelu: %p, backward: %d\n",
+                m, n, k, has_bias, sizeof(floatX), transA, transB, batch_count, strideA, strideB, strideOut, accumulate, pre_gelu, backward);
+        // print typeA/B/C/D, bias, etc.
+        printf("typeA: %s, typeB: %s, typeD: %s, BiasType: %s, AType: %s, BType: %s, CType: %s, DType: %s\n",
+                typeid(typeA).name(), typeid(typeB).name(), typeid(typeD).name(), typeid(BiasType).name(),
+                typeid(AType).name(), typeid(BType).name(), typeid(CType).name(), typeid(DType).name());
+        // print the actual BiasType/AType/etc. and CUBLAS_LOWP
+        printf("BiasType: %d, AType: %d, BType: %d, CType: %d, DType: %d, CUBLAS_LOWP: %d\n",
+                BiasType, AType, BType, CType, DType, CUBLAS_LOWP);
+        printf("transA: %d, transB: %d, accumulate: %d, has_bias: %d, has_gelu: %d, backward: %d\n",
+                transA, transB, accumulate, has_bias, has_gelu, backward);
+        */
     }
 
     // set whether to accumulate (i.e. D += C) or not - note this isn't considered in algorithm selection (?!)
@@ -237,21 +297,27 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 }
 
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
-void matmul_forward_cublaslt(floatX* out,
-                     floatX* inp, floatX* weight, floatX* bias,
+template <typename typeA=floatX, typename typeB=floatX, typename typeD=floatX>
+void matmul_forward_cublaslt(typeD* out,
+                     typeB* inp, typeA* weight, void* bias,
                      int B, int T, int C, int OC, cudaStream_t stream,
-                     floatX* pre_gelu=NULL, int gelu_fusion=1) {
+                     void* pre_gelu=NULL, int gelu_fusion=1) {
     // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for fused GELU on Ada/Ampere (?)
     if (gelu_fusion < 1 && pre_gelu) {
-        matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-        gelu_forward(out, pre_gelu, B*T*OC, stream);
+        // check typeD is floatX
+        if constexpr (std::is_same_v<typeD, floatX>) {
+            matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+            gelu_forward(out, (floatX*)pre_gelu, B*T*OC, stream);
+        } else {
+            assert(false);
+        }
     } else {
         matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
     }
 }
 
-void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
-                     floatX* dout, floatX* inp, floatX* weight,
+void matmul_backward(floatG* dinp, floatX16* dweight, floatX16* dbias,
+                     floatG* dout, floatX* inp, floatW* weight,
                      float* dbias_buffer,
                      int B, int T, int C, int OC, cudaStream_t stream,
                      floatX* pre_gelu=NULL, int gelu_fusion=1) {
@@ -259,13 +325,13 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
 
     // backward to bias, if given, does a +=
     if (dbias != NULL) {
-        // Each warp is responsible for 8 * "x128::size" = 64 OCs at BF16 (OC must be a multiple of 64!)
+        // Each warp is responsible for 8 * "g128::size" = 64 OCs at BF16 (OC must be a multiple of 64!)
         // Block size is 1024 | 768 threads (32|24 warps) and we reduce those values into 1 at the end
 
         const int block_size = deviceProp.maxThreadsPerMultiProcessor == 1536 ? 768 : 1024;
 
         dim3 block_dim = {4, 8, (unsigned)block_size/WARP_SIZE};
-        const int OC_per_warp = block_dim.y * x128::size; // 64 at BF16
+        const int OC_per_warp = block_dim.y * g128::size; // 64 at BF16
         const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
         const int grid_size_y = max(1, deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / (block_size * grid_size_x)); // full GPU!
 

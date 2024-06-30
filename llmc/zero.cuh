@@ -29,11 +29,11 @@ Utilities for ZeRO sharding
 #ifdef MULTI_GPU
 
 #if defined(ENABLE_FP32)
-const ncclDataType_t ncclFloatX = ncclFloat;
+const ncclDataType_t ncclFloatX16 = ncclFloat;
 #elif defined(ENABLE_FP16)
-const ncclDataType_t ncclFloatX = ncclHalf;
-#else // Default to bfloat16
-const ncclDataType_t ncclFloatX = ncclBfloat16;
+const ncclDataType_t ncclFloatX16 = ncclHalf;
+#else // Default to bfloat16 (also for FP8)
+const ncclDataType_t ncclFloatX16 = ncclBfloat16;
 #endif
 
 void nccl_check(ncclResult_t status, const char *file, int line) {
@@ -511,7 +511,7 @@ ShardInfo multi_gpu_get_shard_offset(size_t elements, const MultiGpuConfig* mult
 // to call this function if pointers and pointers_sizes do not match.
 template<int N>
 void multi_gpu_async_reduce_gradient(
-    floatX* const (&pointers)[N], const size_t (&pointers_sizes)[N],
+    floatX16* const (&pointers)[N], const size_t (&pointers_sizes)[N],
     MultiGpuConfig* multi_gpu_config, cudaStream_t compute_stream) {
     if (multi_gpu_config->num_processes == 1) {
         return; // no multi-GPU, just exit.
@@ -532,7 +532,7 @@ void multi_gpu_async_reduce_gradient(
             ncclCheck(ncclAllReduce(
                 pointers[i], pointers[i],
                 pointers_sizes[i],
-                ncclFloatX, ncclAvg,
+                ncclFloatX16, ncclAvg,
                 multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
             ));
         } else if(multi_gpu_config->zero_stage == 1) {
@@ -542,7 +542,7 @@ void multi_gpu_async_reduce_gradient(
             ncclCheck(ncclReduceScatter(
                 pointers[i], pointers[i] + shard_offset,
                 shard_size,
-                ncclFloatX, ncclAvg,
+                ncclFloatX16, ncclAvg,
                 multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
             ));
         }
@@ -552,4 +552,3 @@ void multi_gpu_async_reduce_gradient(
 }
 
 #endif
-

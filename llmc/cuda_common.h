@@ -96,6 +96,16 @@ typedef __nv_bfloat16 floatX;
 #define PRECISION_MODE PRECISION_BF16
 #endif
 
+#if defined(ENABLE_FP8)
+typedef __nv_bfloat16 floatW; // todo - will become FP8?
+typedef __nv_fp8_e5m2 floatG;
+typedef __nv_bfloat16 floatX16; // todo - this should probably be half?
+#else
+typedef floatX floatW;
+typedef floatX floatG;
+typedef floatX floatX16;
+#endif
+
 // ----------------------------------------------------------------------------
 // Load and store with streaming cache hints
 // Older nvcc does not provide __ldcs and __stcs for bfloat16, despite these

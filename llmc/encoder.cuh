@@ -17,7 +17,7 @@ In the backward pass, the gradients flow to both, handled by different kernels
 // CUDA kernels
 
 __global__ void encoder_forward_kernel3(floatX* out,
-                               const int* inp, const floatX* wte, const floatX* wpe,
+                               const int* inp, const floatW* wte, const floatW* wpe,
                                int B, int T, int C) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     int N = B * T * C;
@@ -31,21 +31,23 @@ __global__ void encoder_forward_kernel3(floatX* out,
     int ix = inp[b * T + t];
 
     floatX* out_btc = out + b * T * C + t * C + c;
-    const floatX* wte_ix = wte + ix * C + c;
-    const floatX* wpe_tc = wpe + t * C + c;
+    const floatW* wte_ix = wte + ix * C + c;
+    const floatW* wpe_tc = wpe + t * C + c;
 
     x128 packed_out;
-    x128 wte128 = load128cs(wte_ix);
-    x128 wpe128 = load128cs(wpe_tc);
-    for (int k = 0; k < x128::size; k++) {
-        packed_out[k] = (floatX)((float)wte128[k] + (float)wpe128[k]);
+    for (int o = 0; o < x_to_w_ratio; o++) {
+        w128 wte128 = load128cs(wte_ix + o*w128::size); // todo8 - scaling
+        w128 wpe128 = load128cs(wpe_tc + o*w128::size); // todo8 - scaling
+        for (int k = 0; k < w128::size; k++) {
+            packed_out[k+o*w128::size] = (floatX)((float)wte128[k] + (float)wpe128[k]);
+        }
     }
-    store128(out_btc, packed_out);
+    store128(out_btc, packed_out); // todo8 - scaling
 }
 
 template <int BLOCK_SIZE=256>
-__global__ void wte_backward_kernel(floatX* dwte,
-                                    const int4* bucket_info, const int* workload_indices, const floatX* dout, const int* inp,
+__global__ void wte_backward_kernel(floatX16* dwte,
+                                    const int4* bucket_info, const int* workload_indices, const floatG* dout, const int* inp,
                                     unsigned int seed, int B, int T, int C) {
     // In order to be deterministic, we preprocess the inputs on the cpu into "buckets"
     // Each bucket corresponds to (WARP_SIZE * x128::size) channels for a single vocabulary token
@@ -76,8 +78,8 @@ __global__ void wte_backward_kernel(floatX* dwte,
     for(int item = warp_id; item < bucket_size; item += BLOCK_SIZE/WARP_SIZE) {
         int bt = workload_indices[bucket_start_idx + item];
 
-        const floatX* dout_btc = dout + bt * C + c;
-        x128 packed_inp1 = load128cs(dout_btc);
+        const floatG* dout_btc = dout + bt * C + c;
+        g128 packed_inp1 = load128cs(dout_btc); // todo8 - scaling
         for (int k = 0; k < packed_inp1.size; k++) {
             accum[k] += (float)packed_inp1[k];
         }
@@ -92,8 +94,11 @@ __global__ void wte_backward_kernel(floatX* dwte,
     }
 
     // Read dwte for warp 0 even if other warps are not finished yet to maximise latency tolerance
-    floatX* dwte_ix = dwte + bucket_ix * C + c;
-    x128 packed_in_out = load128(dwte_ix);
+    floatX16* dwte_ix = dwte + bucket_ix * C + c;
+    x16x128 packed_in_out[x_to_x16_ratio];
+    for (int o = 0; o < x_to_x16_ratio; o++) {
+        packed_in_out[o] = load128(dwte_ix + o*x16x128::size);
+    }
 
     // note: threads which have returned are considered synchronised by CUDA so no risk of deadlock
     __syncthreads();
@@ -105,19 +110,21 @@ __global__ void wte_backward_kernel(floatX* dwte,
         }
     }
 
-    // Add the result to dwte and write back to global memory (read-modify-write)
-    for (unsigned int k = 0; k < x128::size; k++) {
-        // We use stochastic rounding to go from FP32 to BF16
-        // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
-        // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
-        // and that somehow messing the quality of random numbers
-        stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + bucket * WARP_SIZE + threadIdx.x + k);
+    for (int o = 0; o < x_to_x16_ratio; o++) {
+        // Add the result to dwte and write back to global memory (read-modify-write)
+        for (unsigned int k = 0; k < x16x128::size; k++) {
+            // We use stochastic rounding to go from FP32 to BF16
+            // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
+            // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
+            // and that somehow messing the quality of random numbers
+            stochastic_rounding(accum[k+o*x16x128::size] + (float)packed_in_out[o][k], &packed_in_out[o][k], seed + bucket * WARP_SIZE + threadIdx.x + k + o*x16x128::size);
+        }
+        store128(dwte_ix + o*x16x128::size, packed_in_out[o]);
     }
-    store128(dwte_ix, packed_in_out);
 }
 
-__global__ void wpe_backward_kernel(floatX* dwpe,
-                                    const floatX* dout, const int* inp,
+__global__ void wpe_backward_kernel(floatX16* dwpe,
+                                    const floatG* dout, const int* inp,
                                     int B, int T, int C, unsigned int seed) {
     // Each thread handles x128::size "channel positions", e.g. 256 per warp for BF16
     // For gpt2-124M BF16, C=768 and T=1024, so 3 warps per channel and 3072 warps in total
@@ -130,32 +137,34 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
     // if C is not a multiple of WARP_SIZE*x128::size, it's OK for some warps to handle multiple t
     int t = idx / C;
     int c = idx % C;
-    float accum[x128::size] = {0.0f};
+    float accum[g128::size] = {0.0f};
 
     for (int b = 0; b < B; b++) {
-        x128 packed_dout = load128cs(dout + (b * T * C) + (t * C) + c); // will never be read again
-        for (int k = 0; k < x128::size; k++) {
+        g128 packed_dout = load128cs(dout + (b * T * C) + (t * C) + c); // todo8 - scaling
+        for (int k = 0; k < g128::size; k++) {
             accum[k] += (float)packed_dout[k];
         }
     }
 
-    floatX* dwpe_tc = dwpe + (t * C) + c;
-    x128 packed_dwpe = load128(dwpe_tc);
-    for (unsigned int k = 0; k < x128::size; k++) {
-        // We use stochastic rounding to go from FP32 to BF16
-        // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
-        // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
-        // and that somehow messing the quality of random numbers
-        stochastic_rounding(accum[k] + (float)packed_dwpe[k], &packed_dwpe[k], seed + idx + k);
+    floatX16* dwpe_tc = dwpe + (t * C) + c;
+    for (int o = 0; o < x_to_x16_ratio; o++) {
+        x16x128 packed_dwpe = load128(dwpe_tc + o*x16x128::size);
+        for (unsigned int k = 0; k < x16x128::size; k++) {
+            // We use stochastic rounding to go from FP32 to BF16
+            // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
+            // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
+            // and that somehow messing the quality of random numbers
+            stochastic_rounding(accum[k+o*x16x128::size] + (float)packed_dwpe[k], &packed_dwpe[k], seed + idx + k);
+        }
+        store128(dwpe_tc + o*x16x128::size, packed_dwpe);
     }
-    store128(dwpe_tc, packed_dwpe);
 }
 
 // ----------------------------------------------------------------------------
 // kernel launchers
 
 void encoder_forward(floatX* out,
-                     const int* inp, const floatX* wte, const floatX* wpe,
+                     const int* inp, const floatW* wte, const floatW* wpe,
                      int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
@@ -166,11 +175,14 @@ void encoder_forward(floatX* out,
 }
 
 // Fully deterministic (see comments in wte_backward_kernel and wpe_backward_kernel for more details)
-void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
+void encoder_backward(floatX16* dwte, floatX16* dwpe, floatX* scratch, // gpu outputs & scratch
                       int* workload_indices, int4* bucket_info,    // cpu scratch buffers
-                      const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
+                      const floatG* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
                       int B, int T, int C, unsigned int seed, cudaStream_t stream) {
     NVTX_RANGE_FN();
+    assert(sizeof(floatX) == sizeof(floatG)); // todo - put somewhere global
+    assert(sizeof(floatW) >= sizeof(floatX)); // todo - do we need to support the other way? (sigh)
+    assert(sizeof(floatX16) >= sizeof(floatX));
 
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
     const int block_size = 256;

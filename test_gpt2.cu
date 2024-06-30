@@ -241,9 +241,9 @@ int main(int argc, char *argv[]) {
                     memcpy(dst_iterator, src_iterator, model.param_elements[i] * sizeof(float));
                 } else {
                     // low-precision tensor => convert to float
-                    assert(model.param_sizeof[i] == sizeof(floatX)); // floatX is the single non-float supported atm
+                    assert(model.param_sizeof[i] == sizeof(floatX16)); // floatX16 is the single non-float supported atm
                     for (size_t j = 0; j < model.param_elements[i]; j++) {
-                        dst_iterator[j] = ((floatX*)src_iterator)[j]; // convert to float
+                        dst_iterator[j] = (float)((floatX16*)src_iterator)[j]; // convert to float
                     }
                 }
                 // for convenience record the position of comparison for reality vs. expectation

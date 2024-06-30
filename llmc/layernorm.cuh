@@ -18,8 +18,8 @@ E.g., the layernorms are connected to the residuals so we += in layernorm backwa
 // CUDA kernels
 
 __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
-                                    const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
-                                    const floatX* __restrict__ bias, int N, int C) {
+                                    const floatX*  __restrict__ inp, const floatW*  __restrict__ weight,
+                                    const floatW* __restrict__ bias, int N, int C) {
     int lane_id = threadIdx.x % WARP_SIZE;
     int warp_id = threadIdx.x / WARP_SIZE;
     int num_warps = blockDim.x / WARP_SIZE;
@@ -65,8 +65,8 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __res
 }
 
 __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
-                                    const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
-                                    const floatX* __restrict__ bias, int N, int C) {
+                                    const floatX*  __restrict__ inp, const floatW*  __restrict__ weight,
+                                    const floatW* __restrict__ bias, int N, int C) {
     assert(blockDim.x == WARP_SIZE);
 
     // load weights and biases into shared memory
@@ -74,14 +74,14 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
     extern __shared__ char* params[];
     // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
     // let's keep everything as x128
-    x128* s_weight = reinterpret_cast<x128*>(params);
-    x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
-    x128* s_in = reinterpret_cast<x128*>(params) + ((2 + threadIdx.y) * C / x128::size);
+    w128* s_weight = reinterpret_cast<w128*>(params);
+    w128* s_bias = reinterpret_cast<w128*>(params) + (C / w128::size);
+    x128* s_in = reinterpret_cast<x128*>(reinterpret_cast<w128*>(params) + ((2 + threadIdx.y) * C / w128::size));
 
-    int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;
-    for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * x128::size) {
-        s_weight[i/x128::size] = load128(weight + i);
-        s_bias[i/x128::size] = load128(bias + i);
+    int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * w128::size;
+    for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * w128::size) {
+        s_weight[i/w128::size] = load128(weight + i);
+        s_bias[i/w128::size] = load128(bias + i);
     }
     __syncthreads();
 
@@ -118,15 +118,17 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
 
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
         const x128 in_data = s_in[c / x128::size];
-        const x128 w = s_weight[c / x128::size];
-        const x128 b = s_bias[c / x128::size];
         x128 out_data;
-        for(int k = 0; k < x128::size; ++k) {
-            float n = s * ((float)in_data[k] - m); // normalized output
-            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
-            out_data[k] = (floatX)o;
-        }
 
+        for (int outer = 0; outer < x_to_w_ratio; outer++) {
+            const w128 w = s_weight[c / w128::size + outer];
+            const w128 b = s_bias[c / w128::size + outer];
+            for(int k = 0; k < w128::size; ++k) {
+                float n = s * ((float)in_data[k+outer*w128::size] - m); // normalized output
+                float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+                out_data[k+outer*w128::size] = (floatX)o;
+            }
+        }
         store128cs(out + c, out_data);
     }
     // cache the mean and rstd for the backward pass later
@@ -141,7 +143,7 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
 
 __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed, float* mean, float* rstd,
                                                const floatX* inp1, const floatX* inp2,
-                                               const floatX* weight, const floatX* bias,
+                                               const floatW* weight, const floatW* bias,
                                                int N, int C) {
     assert(blockDim.x == WARP_SIZE);
 
@@ -149,15 +151,15 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     // do this before we allow any threads to exit!
     extern __shared__ char* params[];
     // load128/store128 sometimes generated multiple instructions when the types here were floatX*, so
-    // let's keep everything as x128
-    x128* s_weight = reinterpret_cast<x128*>(params);
-    x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
-    x128* s_res = reinterpret_cast<x128*>(params) + ((2 + threadIdx.y) * C / x128::size);
+    // let's keep everything as w128
+    w128* s_weight = reinterpret_cast<w128*>(params);
+    w128* s_bias = reinterpret_cast<w128*>(params) + (C / w128::size);
+    x16x128* s_res = reinterpret_cast<x16x128*>(reinterpret_cast<w128*>(params) + ((2 + threadIdx.y) * C / w128::size));
 
-    int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;
-    for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * x128::size) {
-        s_weight[i/x128::size] = load128(weight + i);
-        s_bias[i/x128::size] = load128(bias + i);
+    int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x16x128::size;
+    for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * w128::size) {
+        s_weight[i/w128::size] = load128(weight + i);
+        s_bias[i/w128::size] = load128(bias + i);
     }
     __syncthreads();
 
@@ -176,21 +178,26 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
         const x128 in1 = load128cs(inp1 + c);
         const x128 in2 = load128cs(inp2 + c);
         x128 out;
-        for(int k = 0; k < x128::size; ++k) {
-            out[k] = (floatX)((float)in1[k] + (float)in2[k]);
-            sum += (float)out[k];
+        for (int o = 0; o < x_to_x16_ratio; o++) {
+            x16x128 out16;
+            for(int k = 0; k < x16x128::size; ++k) {
+                float out_float = (float)in1[k] + (float)in2[k]; // todo8 - scaling
+                out16[k] = (floatX16)out_float;
+                out[k+o*x16x128::size] = (floatX)out_float; // todo8 - SCALING!!! (this will never work like this...)
+                sum += (float)out_float;
+            }
+            s_res[c / x16x128::size] = out16;
         }
         store128cs(residual + c, out);
-        s_res[c / x128::size] = out;
     }
 
     sum = warpReduceSum(sum);
     float m = sum / C;
     float v = 0.f;
 
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 res = s_res[c / x128::size];
-        for(int k = 0; k < x128::size; ++k) {
+    for(int c = threadIdx.x * x16x128::size; c < C; c += WARP_SIZE * x16x128::size) {
+        const x16x128 res = s_res[c / x16x128::size];
+        for(int k = 0; k < x16x128::size; ++k) {
             v += ((float)res[k] - m) * ((float)res[k] - m);
         }
     }
@@ -199,22 +206,30 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     float s = rsqrtf(v + eps);
 
     for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 res = s_res[c / x128::size];
-        const x128 w = s_weight[c / x128::size];
-        const x128 b = s_bias[c / x128::size];
-        x128 out;
-        for(int k = 0; k < x128::size; ++k) {
-            float n = s * ((float)res[k] - m); // normalized output
-            float o = n * (float)w[k] + (float)b[k]; // scale and shift it
-            out[k] = (floatX)o;
+        x16x128 res[x_to_x16_ratio];
+        for (int o = 0; o < x_to_x16_ratio; o++) {
+            res[o] = s_res[c / x16x128::size + o];
         }
-
+        x128 out;
+        #pragma unroll
+        for (int outer = 0; outer < x_to_w_ratio; outer++) {
+            const w128 w = s_weight[c / w128::size + outer];
+            const w128 b = s_bias[c / w128::size + outer];
+            #pragma unroll
+            for(int k = 0; k < w128::size; ++k) {
+                size_t res_idx_0 = (k+outer*w128::size) / x16x128::size; // todo8 - FML...
+                size_t res_idx_1 = (k+outer*w128::size) % x16x128::size;
+                float n = s * ((float)res[res_idx_0][res_idx_1] - m); // normalized output
+                float o = n * (float)w[k] + (float)b[k]; // scale and shift it
+                out[k+outer*w128::size] = (floatX)o;
+            }
+        }
         store128cs(normed + c, out);
     }
     // cache the mean and rstd for the backward pass later
     if(threadIdx.x == 0) {
-        mean[idx] = (floatX)m;
-        rstd[idx] = (floatX)s;
+        mean[idx] = m;
+        rstd[idx] = s;
     }
 }
 
@@ -231,8 +246,8 @@ __global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const f
 }
 
 __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with only 1024 threads?
-    layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                                const floatX* dout, const floatX* inp, const floatX* weight,
+    layernorm_backward_kernel10(floatG* dinp, floatX16* dweight, floatX16* dbias, float* scratch,
+                                const floatG* dout, const floatX* inp, const floatW* weight,
                                 const float* mean, const float* rstd,
                                 int B, int T, int C) {
     int BLOCK_SIZE = blockDim.x;
@@ -264,21 +279,23 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
     __syncthreads();
 
     for (int bt = baseIdx; bt < B * T; bt += warpsInGrid) {
-        const floatX* dout_bt = dout + bt * C;
-        const floatX* inp_bt = inp +bt * C;
-        floatX* dinp_bt = dinp + bt * C;
+        const floatG* dout_bt = dout + bt * C;
+        const floatX* inp_bt = inp + bt * C;
+        floatG* dinp_bt = dinp + bt * C;
 
         // first: two reduce operations
         float dnorm_mean = 0.0f;
         float dnorm_norm_mean = 0.0f;
         for (int i = warpThreadIdx * x128::size; i < C; i += WARP_SIZE * x128::size) {
-            x128 dout128_i   = load128(dout_bt + i);
+            g128 dout128_i   = load128(dout_bt + i);
             x128 inp128_i    = load128(inp_bt  + i);
-            x128 weight128_i = load128(weight  + i);
-            for (int k = 0; k < x128::size; k++) {
-                float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k];
-                dnorm_mean += dnorm_i;
-                dnorm_norm_mean += dnorm_i * (float)inp128_i[k];
+            for (int o = 0; o < x_to_w_ratio; o++) {
+                w128 weight128_i = load128(weight  + i + o*w128::size);
+                for (int k = 0; k < w128::size; k++) {
+                    float dnorm_i = (float)weight128_i[k] * (float)dout128_i[k+o*w128::size];
+                    dnorm_mean += dnorm_i;
+                    dnorm_norm_mean += dnorm_i * (float)inp128_i[k+o*w128::size];
+                }
             }
         }
 
@@ -290,21 +307,26 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
         for (int c = 0; c < iterations_C; c++) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
 
-            x128 dout128   = x128::zeros();
+            g128 dout128   = g128::zeros();
             x128 inp128    = x128::zeros();
-            x128 dinp128   = x128::zeros();
-            x128 weight128 = x128::zeros();
+            g128 dinp128   = g128::zeros();
+            w128 weight128 = w128::zeros();
 
             if(global_index < C) {
                 dout128 = load128cs(dout_bt + global_index);
                 inp128 = load128cs(inp_bt + global_index);
                 dinp128 = load128(dinp_bt + global_index);
-                weight128 = load128(weight + global_index);
             }
 
+            #pragma unroll
             for(int o = 0; o < x128::size / f128::size; ++o) {
                 f128 dbias_f;
                 f128 dweight_f;
+
+                if(global_index < C && (o % x_to_w_ratio) == 0) {
+                    weight128 = load128(weight + global_index + o*f128::size);
+                }
+
                 for(int i = 0; i < f128::size; ++i) {
                     int x = o * f128::size + i;
                     float dout_i = (float)dout128[x];
@@ -313,11 +335,11 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
                     dweight_f[i] = norm_bti * dout_i;
 
                     float dval = 0.0f;
-                    dval += (float) weight128[x] * (float)dout128[x]; // term 1
+                    dval += (float) weight128[x % w128::size] * (float)dout128[x]; // term 1
                     dval -= dnorm_mean; // term 2
                     dval -= norm_bti * dnorm_norm_mean; // term 3
                     dval *= rstd_bt; // final scale
-                    dinp128[x] = (floatX) ((float) dinp128[x] + dval);
+                    dinp128[x] = (floatG) ((float)dinp128[x] + dval);
                 }
 
                 if (warpId != 0) {
@@ -403,21 +425,22 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
         // convert from float/FP32 to floatX/BF16 for the final write
         // this is separate because it cannot use as many warps as the above (f128 vs x128)
         // todo - if we split this code into another kernel, we could maybe do it at the same time?
-        for (int c = warpId; c < iterations_C; c += warpsInBlock) {
+        // todo8 - this looks wrong, too tired
+        for (int c = warpId * x_to_x16_ratio; c < iterations_C; c += warpsInBlock * x_to_x16_ratio) {
             int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
             if (global_index >= C) {
                 break;
             }
 
-            x128 dbias128 = load128(dbias + global_index);
-            x128 dweight128 = load128(dweight + global_index);
-            for(int o = 0; o < x128::size / f128::size; ++o) {
+            x16x128 dbias128 = load128(dbias + global_index);
+            x16x128 dweight128 = load128(dweight + global_index);
+            for(int o = 0; o < x16x128::size / f128::size; ++o) {
                 f128 s_db = load128(dbias_shared + global_index + o * f128::size);
                 f128 s_dw = load128(dweight_shared + global_index + o * f128::size);
                 for(int i = 0; i < f128::size; ++i) {
                     int x = o * f128::size + i;
-                    dbias128[x] = (floatX)(s_db[i] + (float)dbias128[x]);
-                    dweight128[x] = (floatX)(s_dw[i] + (float)dweight128[x]);
+                    dbias128[x] = (floatX16)(s_db[i] + (float)dbias128[x]);
+                    dweight128[x] = (floatX16)(s_dw[i] + (float)dweight128[x]);
                 }
             }
             store128(dbias + global_index, dbias128);
@@ -431,14 +454,14 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
 
 // similar to `fused_residual_forward5`
 void layernorm_forward(floatX* out, float* mean, float* rstd,
-                       floatX* inp, const floatX* weight, const floatX* bias,
+                       floatX* inp, const floatW* weight, const floatW* bias,
                        int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
     const int N = B * T;
     const int grid_size = CEIL_DIV(N, block_y);
-    size_t smem = (2 + block_y) * C * sizeof(floatX);
+    size_t smem = (2*sizeof(floatW) + block_y*sizeof(floatX16)) * C;
 
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
@@ -466,12 +489,12 @@ void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N
 
 void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, float* rstd,
                              const floatX* inp1, const floatX* inp2,
-                             const floatX* weight, const floatX* bias,
+                             const floatW* weight, const floatW* bias,
                              int N, int C, cudaStream_t stream) {
     const int block_size = 256;
     int block_y = block_size / WARP_SIZE;
     const int grid_size = CEIL_DIV(N, block_y);
-    size_t smem = (2 + block_y) * C * sizeof(floatX);
+    size_t smem = (2*sizeof(floatW) + block_y*sizeof(floatX16)) * C;
 
     // in order to use more than 48 KiB of smem, need to call cudaFuncSetAttribute
     // this may fail, in which case we fall back to the smem free implementation.
@@ -489,8 +512,8 @@ void fused_residual_forward5(floatX* residual, floatX* normed, float* mean, floa
     cudaCheck(cudaGetLastError());
 }
 
-void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                        const floatX* dout, const floatX* inp, const floatX* weight, const float* mean, const float* rstd,
+void layernorm_backward(floatG* dinp, floatX16* dweight, floatX16* dbias, float* scratch,
+                        const floatG* dout, const floatX* inp, const floatW* weight, const float* mean, const float* rstd,
                         int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 512;
@@ -498,6 +521,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     const int grid_size = blocks_per_sm * deviceProp.multiProcessorCount;
     size_t rounded_C = CEIL_DIV(C, (32 * x128::size)) * (32 * x128::size);
     size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
+
 
     cudaCheck(cudaMemsetAsync(scratch, 0, 1 * sizeof(float), stream)); // only need to reset the flag to 0
     layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);

@@ -2,27 +2,20 @@
 // we change some unrelated piece of the code.
 // TODO this currently duplicates some of the utilities from the main file
 
-#define CUDNN_CPP
 #define NOMINMAX
 #include "cudnn_att.h"
 #include <cudnn_frontend.h>
 
 namespace fe = cudnn_frontend;
 
-#ifdef ENABLE_FP8 // FP8 mode is not ready yet, and only supports head size of 128, sigh...
-//#define CUDNN_FP8_MODE
-#endif
-
 // Specific configurations based on the enabled precision
 #if defined(ENABLE_FP32)
 static_assert(false, "cuDNN is not supported in FP32 mode.")
 // use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
-#define CUDNN_TYPE fe::DataType_t::HALF
-#elif defined(CUDNN_FP8_MODE)
-#define CUDNN_TYPE fe::DataType_t::FP8_E4M3
+#define CUDNN_16BIT fe::DataType_t::HALF
 #else // Default to bfloat16
-#define CUDNN_TYPE fe::DataType_t::BFLOAT16
+#define CUDNN_16BIT fe::DataType_t::BFLOAT16
 #endif
 
 static cudnnHandle_t cudnn_handle;
@@ -55,11 +48,7 @@ enum UIDs {
     dO_UID,
     dQ_UID,
     dK_UID,
-    dV_UID,
-    descale_q_UID, descale_k_UID, descale_v_UID,
-    descale_s_UID, descale_o_UID, descale_dO_UID, descale_dP_UID,
-    scale_s_UID, scale_o_UID, scale_dP_UID, scale_dQ_UID, scale_dK_UID, scale_dV_UID,
-    amax_s_UID, amax_o_UID, amax_dQ_UID, amax_dK_UID, amax_dV_UID, amax_dP_UID
+    dV_UID
 };
 
 // Need a cache because graph->build_operation_graph() is slow but everything else seems fast
@@ -79,7 +68,7 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
     }
 
     auto graph = std::make_shared<fe::graph::Graph>();
-    graph->set_io_data_type(CUDNN_TYPE)
+    graph->set_io_data_type(CUDNN_16BIT)
           .set_intermediate_data_type(fe::DataType_t::FLOAT)
           .set_compute_data_type(fe::DataType_t::FLOAT);
 
@@ -103,33 +92,6 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
                                .set_is_pass_by_value(true)
                                .set_data_type(fe::DataType_t::FLOAT));
 
-#if defined(CUDNN_FP8_MODE)
-    auto sdpa_fp8_options = fe::graph::SDPA_fp8_attributes()
-                                .set_name("flash_attention_fp8")
-                                .set_is_inference(is_inference_only)
-                                .set_causal_mask(true)
-                                .set_attn_scale(attn_scale);
-
-    assert((cudnnGetVersion() >= 90100) && deviceProp.major >= 9);
-
-    auto descale_q = graph->tensor(fe::graph::Tensor_attributes()
-                                          .set_name("Descale_Q")
-                                          .set_uid(descale_q_UID)
-                                          .set_dim({1, 1, 1, 1})
-                                          .set_stride({1, 1, 1, 1})
-                                          .set_data_type(fe::DataType_t::FLOAT));
-    auto descale_k = graph->tensor_like(descale_q, "Descale_K"); descale_k->set_uid(descale_k_UID);
-    auto descale_v = graph->tensor_like(descale_q, "Descale_V"); descale_v->set_uid(descale_v_UID);
-    auto descale_s = graph->tensor_like(descale_q, "Descale_S"); descale_s->set_uid(descale_s_UID);
-    auto scale_s   = graph->tensor_like(descale_q, "Scale_S"); scale_s->set_uid(scale_s_UID);
-    auto scale_o   = graph->tensor_like(descale_q, "Scale_O"); scale_o->set_uid(scale_o_UID);
-
-    auto [O, stats, amax_s, amax_o] =
-        graph->sdpa_fp8(Q, K, V, descale_q, descale_k, descale_v, descale_s, scale_s, scale_o, sdpa_fp8_options);
-
-    amax_o->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT).set_uid(amax_o_UID);
-    amax_s->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT).set_uid(amax_s_UID);
-#else
     auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
     sdpa_options.set_is_inference(is_inference_only);
     sdpa_options.set_attn_scale(attn_scale);
@@ -137,7 +99,6 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
 
     // Create the graph operation and get the output tensors back
     auto [O, stats] = graph->sdpa(Q, K, V, sdpa_options);
-#endif
 
     // Output is (B, T, NH, HS) BF16/FP16 and stats for backward pass is (B, NH, T) FP32
     O->set_output(true).set_dim({B, H, T, HS}).set_stride({H * HS * T, HS, H * HS, 1}).set_uid(O_UID);
@@ -183,7 +144,7 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
     }
 
     auto graph = std::make_shared<fe::graph::Graph>();
-    graph->set_io_data_type(CUDNN_TYPE)
+    graph->set_io_data_type(CUDNN_16BIT)
           .set_intermediate_data_type(fe::DataType_t::FLOAT)
           .set_compute_data_type(fe::DataType_t::FLOAT);
 
@@ -221,57 +182,15 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
                             .set_is_pass_by_value(true)
                             .set_uid(Attn_scale_UID)
                             .set_data_type(fe::DataType_t::FLOAT));
-
-#if defined(CUDNN_FP8_MODE)
-    assert((cudnnGetVersion() >= 90100) && deviceProp.major >= 9);
-
-    auto descale_q  = graph->tensor(fe::graph::Tensor_attributes()
-                                          .set_name("Descale_Q")
-                                          .set_uid(descale_q_UID)
-                                          .set_dim({1, 1, 1, 1})
-                                          .set_stride({1, 1, 1, 1})
-                                          .set_data_type(fe::DataType_t::FLOAT));
-    auto descale_k  = graph->tensor_like(descale_q, "Descale_K"); descale_k->set_uid(descale_k_UID);
-    auto descale_v  = graph->tensor_like(descale_q, "Descale_V"); descale_v->set_uid(descale_v_UID);
-    auto descale_s  = graph->tensor_like(descale_q, "Descale_S"); descale_s->set_uid(descale_s_UID);
-    auto descale_o  = graph->tensor_like(descale_q, "Descale_O"); descale_o->set_uid(descale_o_UID);
-    auto descale_dO = graph->tensor_like(descale_q, "Descale_dO"); descale_dO->set_uid(descale_dO_UID);
-    auto descale_dP = graph->tensor_like(descale_q, "Descale_dP"); descale_dP->set_uid(descale_dP_UID);
-
-    auto scale_s  = graph->tensor_like(descale_q, "Scale_S"); scale_s->set_uid(scale_s_UID);
-    auto scale_dP = graph->tensor_like(descale_q, "Scale_dP"); scale_dP->set_uid(scale_dP_UID);
-    auto scale_dQ = graph->tensor_like(descale_q, "Scale_dQ"); scale_dQ->set_uid(scale_dQ_UID);
-    auto scale_dK = graph->tensor_like(descale_q, "Scale_dK"); scale_dK->set_uid(scale_dK_UID);
-    auto scale_dV = graph->tensor_like(descale_q, "Scale_dV"); scale_dV->set_uid(scale_dV_UID);
-
-    // todo - there is no equivalent to set_deterministic_algorithm() for FP8
-    // does that mean it is not deterministic? :(
-    auto sdpa_fp8_backwards_options = fe::graph::SDPA_fp8_backward_attributes()
-                                    .set_name("sdpa_fp8_backward")
-                                    .set_causal_mask(true)
-                                    .set_attn_scale(attn_scale);
-
-    auto [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP] = graph->sdpa_fp8_backward(
-          Q, K, V, O, dO, stats,
-          descale_q, descale_k, descale_v, descale_o, descale_dO, descale_s, descale_dP,
-          scale_s, scale_dQ, scale_dK, scale_dV, scale_dP, sdpa_fp8_backwards_options);
-
-    amax_dQ->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT).set_uid(amax_dQ_UID);
-    amax_dK->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT).set_uid(amax_dK_UID);
-    amax_dV->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT).set_uid(amax_dV_UID);
-    amax_dP->set_output(true).set_dim({1, 1, 1, 1}).set_data_type(fe::DataType_t::FLOAT).set_uid(amax_dP_UID);
-#else
-    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes()
-                                .set_name("flash_attention_backward")
+    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes().set_name("flash_attention_backward")
 #if CUDNN_FRONTEND_MAJOR_VERSION > 1 || CUDNN_FRONTEND_MINOR_VERSION >= 5
-                                .set_deterministic_algorithm(true) // 1.5+ needs this for determinism
+                            .set_deterministic_algorithm(true) // 1.5+ needs this for determinism
 #endif
-                                .set_causal_mask(true)
-                                .set_attn_scale(attn_scale);
+                            .set_causal_mask(true)
+                            .set_attn_scale(attn_scale);
 
     // Create the graph operation and get the output tensors back
     auto [dQ, dK, dV] = graph->sdpa_backward(Q, K, V, O, dO, stats, sdpa_backward_options);
-#endif
 
     dQ->set_output(true).set_dim({B, NH, T, HS}).set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}).set_uid(dQ_UID);
     dK->set_output(true).set_dim({B, NH, T, HS}).set_stride({3 * NH * HS * T, HS, 3 * NH * HS, 1}).set_uid(dK_UID);
@@ -299,17 +218,13 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
     return graph;
 }
 
-void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
+void attention_forward_cudnn(floatX16* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
-                             floatX* inp,  // input: (B, T, 3, NH, HS) QKV
+                             floatX16* inp,  // input: (B, T, 3, NH, HS) QKV
                              int B, int T, int NH, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
     bool is_inference_only = (stats == nullptr);
-
-    #if defined(ENABLE_FP8) && !defined(CUDNN_FP8_MODE)
-    NH /= 2; // todo - hack: half heads to avoid out of bounds memory reads, very unrealistic
-    #endif
 
     cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
 
@@ -327,24 +242,9 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     std::unordered_map<int64_t , void*> variant_pack = {
         {Q_UID, devPtrQ}, {K_UID, devPtrK}, {V_UID, devPtrV}, {Attn_scale_UID, &attn_scale_cpu}, {O_UID, devPtrO}};
 
-    #if defined(CUDNN_FP8_MODE)
-    auto base_stats = stats - descale_q_UID;
-    variant_pack[descale_q_UID] = base_stats + descale_q_UID;
-    variant_pack[descale_k_UID] = base_stats + descale_k_UID;
-    variant_pack[descale_v_UID] = base_stats + descale_v_UID;
-    variant_pack[descale_s_UID] = base_stats + descale_s_UID;
-    variant_pack[scale_s_UID]   = base_stats + scale_s_UID;
-    variant_pack[scale_o_UID]    = base_stats + scale_o_UID;
-    variant_pack[amax_s_UID]    = base_stats + amax_s_UID;
-    variant_pack[amax_o_UID]    = base_stats + amax_o_UID;
-    #endif
-
     // Add the stats tensor unless we are only doing inference (only needed for backward pass)
     if (is_inference_only == false) {
         variant_pack[Stats_UID] = stats;
-        #if defined(CUDNN_FP8_MODE)
-        variant_pack[Stats_UID] += 32; // stats are after the scale/descale tensors
-        #endif
     }
 
     // Execute graph
@@ -352,15 +252,11 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     cudaCheck(cudaGetLastError());
 }
 
-void attention_backward_cudnn(floatX* dqkvr,                                       // output
-                              floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
+void attention_backward_cudnn(floatX16* dqkvr,                                       // output
+                              floatX16* dout, floatX16* qkvr, floatX16* o, float* stats, // inputs
                               int B, int T, int NH, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int HS = C / NH; // number of features per head
-
-    #if defined(ENABLE_FP8) && !defined(CUDNN_FP8_MODE)
-    NH /= 2; // todo - hack: half heads to avoid out of bounds memory reads, very unrealistic
-    #endif
 
     // Get graph and tensors from cache (or generate it on first use)
     auto graph = lookup_cache_or_build_graph_bwd(B, NH, T, HS);
@@ -383,27 +279,6 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
         {Q_UID, devPtrQ}, {K_UID, devPtrK}, {V_UID, devPtrV}, {O_UID, devPtrO}, {dO_UID, devPtrdO}, {Stats_UID, devPtrStats},
         {dQ_UID, devPtrdQ}, {dK_UID, devPtrdK}, {dV_UID, devPtrdV},
         {Attn_scale_UID, &attn_scale_cpu}};
-
-    #if defined(CUDNN_FP8_MODE)
-    auto base_stats = stats - descale_q_UID;
-    variant_pack[descale_q_UID] = base_stats + descale_q_UID;
-    variant_pack[descale_k_UID] = base_stats + descale_k_UID;
-    variant_pack[descale_v_UID] = base_stats + descale_v_UID;
-    variant_pack[descale_o_UID] = base_stats + descale_o_UID;
-    variant_pack[descale_s_UID] = base_stats + descale_s_UID;
-    variant_pack[descale_dP_UID] = base_stats + descale_dP_UID;
-    variant_pack[descale_dO_UID] = base_stats + descale_dO_UID;
-    variant_pack[scale_s_UID] = base_stats + scale_s_UID;
-    variant_pack[scale_dQ_UID] = base_stats + scale_dQ_UID;
-    variant_pack[scale_dK_UID] = base_stats + scale_dK_UID;
-    variant_pack[scale_dV_UID] = base_stats + scale_dV_UID;
-    variant_pack[scale_dP_UID] = base_stats + scale_dP_UID;
-    variant_pack[amax_dQ_UID] = base_stats + amax_dQ_UID;
-    variant_pack[amax_dK_UID] = base_stats + amax_dK_UID;
-    variant_pack[amax_dV_UID] = base_stats + amax_dV_UID;
-    variant_pack[amax_dP_UID] = base_stats + amax_dP_UID;
-    variant_pack[Stats_UID] += 32;
-    #endif
 
     // Execute graph
     cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
