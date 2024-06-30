@@ -113,6 +113,11 @@ __device__ float cast_value<float, __nv_fp8_e4m3>(__nv_fp8_e4m3 val) {
 }
 
 template<>
+__device__ __nv_fp8_e4m3 cast_value<__nv_fp8_e4m3, __nv_bfloat16>(__nv_bfloat16 val) {
+    return (__nv_fp8_e4m3)float(val);
+}
+
+template<>
 __device__ float cast_value<float, __nv_fp8_e5m2>(__nv_fp8_e5m2 val) {
     return float(val);
 }

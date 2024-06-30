@@ -156,7 +156,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     w128* s_bias = reinterpret_cast<w128*>(params) + (C / w128::size);
     x16x128* s_res = reinterpret_cast<x16x128*>(reinterpret_cast<w128*>(params) + ((2 + threadIdx.y) * C / w128::size));
 
-    int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x16x128::size;
+    int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * w128::size;
     for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * w128::size) {
         s_weight[i/w128::size] = load128(weight + i);
         s_bias[i/w128::size] = load128(bias + i);
@@ -181,12 +181,12 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
         for (int o = 0; o < x_to_x16_ratio; o++) {
             x16x128 out16;
             for(int k = 0; k < x16x128::size; ++k) {
-                float out_float = (float)in1[k] + (float)in2[k]; // todo8 - scaling
+                float out_float = (float)in1[k+o*x16x128::size] + (float)in2[k+o*x16x128::size]; // todo8 - scaling
                 out16[k] = (floatX16)out_float;
                 out[k+o*x16x128::size] = (floatX)out_float; // todo8 - SCALING!!! (this will never work like this...)
                 sum += (float)out_float;
             }
-            s_res[c / x16x128::size] = out16;
+            s_res[c / x16x128::size + o] = out16;
         }
         store128cs(residual + c, out);
     }
@@ -316,6 +316,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
                 dout128 = load128cs(dout_bt + global_index);
                 inp128 = load128cs(inp_bt + global_index);
                 dinp128 = load128(dinp_bt + global_index);
+                weight128 = load128(weight + global_index);
             }
 
             #pragma unroll
@@ -323,7 +324,7 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
                 f128 dbias_f;
                 f128 dweight_f;
 
-                if(global_index < C && (o % x_to_w_ratio) == 0) {
+                if(global_index < C && (o % (w128::size / f128::size)) == 0) {
                     weight128 = load128(weight + global_index + o*f128::size);
                 }
 
@@ -426,8 +427,8 @@ __global__ void __launch_bounds__(512, 2) // todo - any warnings on Turing with 
         // this is separate because it cannot use as many warps as the above (f128 vs x128)
         // todo - if we split this code into another kernel, we could maybe do it at the same time?
         // todo8 - this looks wrong, too tired
-        for (int c = warpId * x_to_x16_ratio; c < iterations_C; c += warpsInBlock * x_to_x16_ratio) {
-            int global_index = (warpThreadIdx * x128::size) + (c * C_per_iteration);
+        for (int c = warpId; c < iterations_C * x_to_x16_ratio; c += warpsInBlock) {
+            int global_index = (warpThreadIdx * x16x128::size) + (c * C_per_iteration);
             if (global_index >= C) {
                 break;
             }

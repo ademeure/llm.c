@@ -1,6 +1,10 @@
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
+
+//#define HACKY_TENSOR_DEBUG
+//#define EXIT_AT_FIRST_LOGIT_OUTPUT
+
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -314,7 +318,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[17] = TENSOR_SPEC(data->lnf_rstd, B * T);
     tensors[18] = TENSOR_SPEC(data->losses, B * T);
     tensors[19] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
-    tensors[20] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
+    tensors[20] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T*2, Vp)));
 
     tensors[21] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
     tensors[22] = TENSOR_SPEC(data->scratch_btc, B * T * C);
@@ -446,6 +450,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     }
 
     // read in model from a checkpoint file
+    printf("Reading model from %s\n", checkpoint_path);
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
@@ -492,10 +497,34 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     assert(model->params_memory == nullptr && "Old model needs to be freed before loading from checkpoint again");
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
+    printf("Parameter bytes: %lu, sizeof(floatW): %lu\n\n\n\n", model->num_parameters_bytes, sizeof(floatW));
+
     // read in all the parameters from file and copy them to device
     file_to_device(model->params_memory, model_file, model->num_parameters_bytes,
                    IO_BUF_SIZE, main_stream);
+
+    // seek to byte 1024 and printf the next 32 bytes
+    fseekCheck(model_file, 1024, SEEK_SET);
+    unsigned char buffer[32];
+    freadCheck(buffer, sizeof(unsigned char), 32, model_file);
+    printf("First 32 bytes of model file after header: ");
+    for (int i = 0; i < 32; i++) {
+        printf("%02x ", buffer[i]);
+    }
+    printf("\n");
+
     fcloseCheck(model_file);
+
+    // Print first 10 elements of params.wte
+    floatW* wte = model->params.wte;
+    floatW* wte_cpu = (floatW*)mallocCheck(model->config.padded_vocab_size * model->config.channels * sizeof(floatW));
+    cudaCheck(cudaMemcpy(wte_cpu, wte, model->config.padded_vocab_size * model->config.channels * sizeof(floatW), cudaMemcpyDeviceToHost));
+    printf("params wte: ");
+    for (int i = 0; i < 10; i++) {
+        printf("%d: %f ", i, (float)wte_cpu[i]);
+    }
+    printf("\n");
+    free(wte_cpu);
 
     // only return from this function once we are certain the params are ready on the GPU
     cudaCheck(cudaDeviceSynchronize());
@@ -692,13 +721,204 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // need not be stored for backward
         floatX16* scratch = (floatX16*)acts.output;
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+
+        // Get scratch
+        #ifdef HACKY_TENSOR_DEBUG
+        floatX16* scratch_cpu = (floatX16*)mallocCheck(B * T * 3 * C * sizeof(floatX16));
+        cudaCheck(cudaMemcpy(scratch_cpu, scratch, B * T * 3 * C * sizeof(floatX16), cudaMemcpyDeviceToHost));
+        printf("scratch: ");
+        int num_printed = 0;
+        for (int i = 0; i < B * T * 3 * C; i++) {
+            if ((float)scratch_cpu[i] != 0.0f) {
+                printf("%d: %f / ", i, (float)scratch_cpu[i]);
+                num_printed++;
+                if (num_printed == 16) {
+                    break;
+                }
+            }
+        }
+        printf("\n");
+        free(scratch_cpu);
+        #endif
+
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+
+        // Get l_atty
+        #ifdef HACKY_TENSOR_DEBUG
+        floatX* atty_cpu = (floatX*)mallocCheck(B * T * C * sizeof(floatX));
+        cudaCheck(cudaMemcpy(atty_cpu, l_atty, B * T * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        printf("atty: ");
+        num_printed = 0;
+        for (int i = 0; i < B * T * C; i++) {
+            if ((float)atty_cpu[i] != 0.0f) {
+                printf("%d: %f / ", i, (float)atty_cpu[i]);
+                num_printed++;
+                if (num_printed == 16) {
+                    break;
+                }
+            }
+        }
+        printf("\n");
+        free(atty_cpu);
+        #endif
         #endif
 
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+
+        // get l_attproj
+        #ifdef HACKY_TENSOR_DEBUG
+        floatX* attproj_cpu = (floatX*)mallocCheck(B * T * C * sizeof(floatX));
+        cudaCheck(cudaMemcpy(attproj_cpu, l_attproj, B * T * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        printf("attproj: ");
+        num_printed = 0;
+        for (int i = B * T * C - 1; i >= 0; i--) {
+            if ((float)attproj_cpu[i] != 0.0f) {
+                printf("%d: %f / ", i, (float)attproj_cpu[i]);
+                num_printed++;
+                if (num_printed == 20) {
+                    break;
+                }
+            }
+        }
+        printf("\n");
+        free(attproj_cpu);
+
+        // get residual
+        floatX* residual_cpu = (floatX*)mallocCheck(B * T * C * sizeof(floatX));
+        cudaCheck(cudaMemcpy(residual_cpu, residual, B * T * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        printf("residual: ");
+        num_printed = 0;
+        for (int i = B * T * C - 1; i >= 0; i--) {
+            if ((float)residual_cpu[i] != 0.0f) {
+                printf("%d: %f / ", i, (float)residual_cpu[i]);
+                num_printed++;
+                if (num_printed == 20) {
+                    break;
+                }
+            }
+        }
+        printf("\n");
+        free(residual_cpu);
+        #endif
+
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C, main_stream);
+
+        // Get l_ln2_mean and l_ln2_rstd (first 10 elements)
+        #ifdef HACKY_TENSOR_DEBUG
+        float* ln2_mean_cpu = (float*)mallocCheck(B * T * sizeof(float));
+        cudaCheck(cudaMemcpy(ln2_mean_cpu, l_ln2_mean, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        printf("ln2_mean: ");
+        for (int i = 0; i < 10; i++) {
+            printf("%d: %f ", i, ln2_mean_cpu[i]);
+        }
+        printf("\n");
+        free(ln2_mean_cpu);
+
+        float* ln2_rstd_cpu = (float*)mallocCheck(B * T * sizeof(float));
+        cudaCheck(cudaMemcpy(ln2_rstd_cpu, l_ln2_rstd, B * T * sizeof(float), cudaMemcpyDeviceToHost));
+        printf("ln2_rstd: ");
+        for (int i = 0; i < 10; i++) {
+            printf("%d: %f ", i, ln2_rstd_cpu[i]);
+        }
+        printf("\n");
+        free(ln2_rstd_cpu);
+
+        // Get l_residual2
+        floatX* residual2_cpu = (floatX*)mallocCheck(B * T * C * sizeof(floatX));
+        cudaCheck(cudaMemcpy(residual2_cpu, l_residual2, B * T * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        printf("residual2: ");
+        num_printed = 0;
+        for (int i = B * T * C - 1; i >= 0; i--) {
+            if ((float)residual2_cpu[i] != 0.0f) {
+                printf("%d: %f / ", i, (float)residual2_cpu[i]);
+                num_printed++;
+                if (num_printed == 20) {
+                    break;
+                }
+            }
+        }
+        printf("\n");
+        free(residual2_cpu);
+        if (l >= 1) {
+            //exit(0);
+        }
+
+        // Get l_ln2
+        floatX* ln2_cpu = (floatX*)mallocCheck(B * T * C * sizeof(floatX));
+        cudaCheck(cudaMemcpy(ln2_cpu, l_ln2, B * T * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        printf("ln2: ");
+        num_printed = 0;
+        for (int i = B * T * C - 1; i >= 0; i--) {
+            if ((float)ln2_cpu[i] != 0.0f) {
+                printf("%d: %f / ", i, (float)ln2_cpu[i]);
+                num_printed++;
+                if (num_printed == 20) {
+                    break;
+                }
+            }
+        }
+        printf("\n");
+        free(ln2_cpu);
+        #endif
+
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+
+        // get l_fch
+        #ifdef HACKY_TENSOR_DEBUG
+        floatX* fch_cpu = (floatX*)mallocCheck(B * T * 4 * C * sizeof(floatX));
+        cudaCheck(cudaMemcpy(fch_cpu, l_fch, B * T * 4 * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        printf("fch: ");
+        num_printed = 0;
+        for (int i = 0; i < B * T * 4 * C; i++) {
+            if ((float)fch_cpu[i] != 0.0f) {
+                printf("%d: %f / ", i, (float)fch_cpu[i]);
+                num_printed++;
+                if (num_printed == 10) {
+                    break;
+                }
+            }
+        }
+        printf("\n");
+        free(fch_cpu);
+
+        // get l_fch_gelu
+        floatX* fch_gelu_cpu = (floatX*)mallocCheck(B * T * 4 * C * sizeof(floatX));
+        cudaCheck(cudaMemcpy(fch_gelu_cpu, l_fch_gelu, B * T * 4 * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        printf("fch_gelu: ");
+        num_printed = 0;
+        for (int i = 0; i < B * T * 4 * C; i++) {
+            if ((float)fch_gelu_cpu[i] != 0.0f) {
+                printf("%d: %f / ", i, (float)fch_gelu_cpu[i]);
+                num_printed++;
+                if (num_printed == 10) {
+                    break;
+                }
+            }
+        }
+        printf("\n");
+        free(fch_gelu_cpu);
+        #endif
+
         matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+
+        // get l_fcproj
+        #ifdef HACKY_TENSOR_DEBUG
+        floatX* fcproj_cpu = (floatX*)mallocCheck(B * T * C * sizeof(floatX));
+        cudaCheck(cudaMemcpy(fcproj_cpu, l_fcproj, B * T * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+        printf("fcproj: ");
+        num_printed = 0;
+        for (int i = 0; i < B * T * C; i++) {
+            if ((float)fcproj_cpu[i] != 0.0f) {
+                printf("%d: %f / ", i, (float)fcproj_cpu[i]);
+                num_printed++;
+                if (num_printed == 20) {
+                    break;
+                }
+            }
+        }
+        printf("\n");
+        free(fcproj_cpu);
+        #endif
 
         // OK, fusion across blocks.
         if(l+1 != L) {
@@ -710,13 +930,94 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b,
                                     B * T, C, main_stream);
         } else {
+            // Get l_residual 2
+            #ifdef HACKY_TENSOR_DEBUG
+            floatX* residual2_cpu = (floatX*)mallocCheck(B * T * C * sizeof(floatX));
+            cudaCheck(cudaMemcpy(residual2_cpu, l_residual2, B * T * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+            printf("residual2: ");
+            num_printed = 0;
+            for (int i = 0; i < B * T * C; i++) {
+                if ((float)residual2_cpu[i] != 0.0f) {
+                    printf("%d: %f / ", i, (float)residual2_cpu[i]);
+                    num_printed++;
+                    if (num_printed == 20) {
+                        break;
+                    }
+                }
+            }
+            printf("\n");
+            free(residual2_cpu);
+            #endif
+
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, l_fcproj,
                                     params.lnfw, params.lnfb,
                                     B * T, C, main_stream);
+
+            // Get l_residual3
+            #ifdef HACKY_TENSOR_DEBUG
+            floatX* residual3_cpu = (floatX*)mallocCheck(B * T * C * sizeof(floatX));
+            cudaCheck(cudaMemcpy(residual3_cpu, l_residual3, B * T * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+            printf("residual3: ");
+            num_printed = 0;
+            for (int i = 0; i < B * T * C; i++) {
+                if ((float)residual3_cpu[i] != 0.0f) {
+                    printf("%d: %f / ", i, (float)residual3_cpu[i]);
+                    num_printed++;
+                    if (num_printed == 20) {
+                        break;
+                    }
+                }
+            }
+            printf("\n");
+            free(residual3_cpu);
+
+            // Get acts.lnf
+            floatX* lnf_cpu = (floatX*)mallocCheck(B * T * C * sizeof(floatX));
+            cudaCheck(cudaMemcpy(lnf_cpu, acts.lnf, B * T * C * sizeof(floatX), cudaMemcpyDeviceToHost));
+            printf("lnf: ");
+            num_printed = 0;
+            for (int i = 0; i < B * T * C; i++) {
+                if ((float)lnf_cpu[i] != 0.0f) {
+                    printf("%d: %f / ", i, (float)lnf_cpu[i]);
+                    num_printed++;
+                    if (num_printed == 20) {
+                        break;
+                    }
+                }
+            }
+            printf("\n");
+            free(lnf_cpu);
+            #endif
         }
+        #ifdef HACKY_TENSOR_DEBUG
+        printf("\n\n\n\n");
+        #endif
     }
 
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+
+    #ifdef HACKY_TENSOR_DEBUG
+    floatX* output_cpu = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
+    cudaCheck(cudaMemcpy(output_cpu, acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost));
+    printf("output: ");
+    int num_printed = 0;
+    for (int i = 0; i < B * T * Vp; i++) {
+        if ((float)output_cpu[i] != 0.0f) {
+            printf("%d: %f / ", i, (float)output_cpu[i]);
+            num_printed++;
+            if (num_printed == 20) {
+                break;
+            }
+        }
+    }
+    printf("\n");
+    free(output_cpu);
+    #endif
+
+    #ifdef EXIT_AT_FIRST_LOGIT_OUTPUT
+    exit(0);
+    #endif
+
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -1808,8 +2109,9 @@ int main(int argc, char *argv[]) {
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
             gpt2_forward(&model, train_loader.inputs, B, T);
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step == grad_accum_steps - 1);
+            //gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step == grad_accum_steps - 1);
         }
+        /*
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
         // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
@@ -1825,8 +2127,9 @@ int main(int argc, char *argv[]) {
             // clip the gradient norm to a maximum value
             float grad_clip = 1.0f;
             float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
-            gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+            //gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
         }
+        */
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
         cudaCheck(cudaEventRecord(end));
@@ -1848,9 +2151,9 @@ int main(int argc, char *argv[]) {
         }
         float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
         printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
-                step + 1, train_num_batches, model.mean_loss, zloss, grad_norm, zgrad, step_learning_rate,
+                step + 1, train_num_batches, model.mean_loss, 0.0f, 0.0f, 0.0f, 0.0f,
                 time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
-        logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
+        logger_log_train(&logger, step, model.mean_loss, 0.0f, 0.0f);
 
         // disable the profiler after 3 steps of optimization
         if (step == 3) { cudaProfilerStop(); }

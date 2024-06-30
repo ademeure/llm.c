@@ -99,10 +99,10 @@ int main(int argc, char *argv[]) {
     common_start(false, true);
 
     // set the right paths
-    #if defined(ENABLE_BF16)
-    const char* load_filename = "gpt2_124M_bf16.bin";
-    #else
+    #if defined(DENABLE_FP32)
     const char* load_filename = "gpt2_124M.bin";
+    #else
+    const char* load_filename = "gpt2_124M_bf16.bin";
     #endif
 
     // build the GPT-2 model from a checkpoint

@@ -140,45 +140,80 @@ void matmul_cublaslt(typeD* d, const typeA* a, const typeB* b, const void* bias,
     cudaDataType DType = CUBLAS_LOWP;
 
 #if defined(ENABLE_FP8)
+    constexpr int num_scratch = 2;
+    static void* matmul_scratch[num_scratch] = {NULL};
+    static size_t matmul_scratch_size[num_scratch] = {0};
+
     // todo - hack - just disable settings not supported in FP8 mode (not correct at all)
-    transA = true;
-    transB = false;
-    if (accumulate) {
-        if constexpr (std::is_same_v<typeD, nv_bfloat16> == false) {
+    if (sizeof(typeA) == 1 || sizeof(typeB) == 1 || sizeof(typeD) == 1) {
+        // HACK!!!
+        transA = true;
+        transB = false;
+        if (accumulate) {
+            if constexpr (std::is_same_v<typeD, nv_bfloat16> == false) {
+                assert(false);
+            }
+        }
+        accumulate = false;
+
+        BiasType = CUDA_R_16BF;
+        CType = CUDA_R_16BF;
+        if constexpr (std::is_same_v<typeD, __nv_fp8_e4m3>) {
+            DType = CUDA_R_8F_E4M3;
+        } else if constexpr (std::is_same_v<typeD, __nv_fp8_e5m2>) {
+            DType = CUDA_R_8F_E5M2;
+        } else if constexpr (std::is_same_v<typeD, nv_bfloat16>) {
+            DType = CUDA_R_16BF;
+        } else {
+            // todo - do we need automatic conversion for other formats?
             assert(false);
         }
-    }
-    accumulate = false;
-
-    BiasType = CUDA_R_16BF;
-    CType = CUDA_R_16BF;
-    if constexpr (std::is_same_v<typeD, __nv_fp8_e4m3>) {
-        DType = CUDA_R_8F_E4M3;
-    } else if constexpr (std::is_same_v<typeD, __nv_fp8_e5m2>) {
-        DType = CUDA_R_8F_E5M2;
-    } else if constexpr (std::is_same_v<typeD, nv_bfloat16>) {
+        if constexpr (std::is_same_v<typeA, __nv_fp8_e4m3>) {
+            AType = CUDA_R_8F_E4M3;
+        } else if constexpr (std::is_same_v<typeA, __nv_fp8_e5m2>) {
+            AType = CUDA_R_8F_E5M2;
+        } else if constexpr (std::is_same_v<typeA, nv_bfloat16>) {
+            size_t size = m*k;
+            // cast BF16 to FP8
+            if (matmul_scratch_size[0] < size) {
+                if (matmul_scratch[0] != NULL) {
+                    cudaCheck(cudaFree(matmul_scratch[0]));
+                }
+                cudaCheck(cudaMalloc(&matmul_scratch[0], size*sizeof(__nv_fp8_e4m3)));
+                matmul_scratch_size[0] = size;
+            }
+            copy_and_cast_kernel<__nv_fp8_e4m3><<<CEIL_DIV(size, 256), 256, 0, stream>>>((__nv_fp8_e4m3*)matmul_scratch[0], (nv_bfloat16*)a, size, 1, 1);
+            a = (typeA*)matmul_scratch[0];
+            AType = CUDA_R_8F_E4M3;
+        } else {
+            assert(false);
+        }
+        if constexpr (std::is_same_v<typeB, __nv_fp8_e4m3>) {
+            BType = CUDA_R_8F_E4M3;
+        } else if constexpr (std::is_same_v<typeB, __nv_fp8_e5m2>) {
+            BType = CUDA_R_8F_E5M2;
+        } else if constexpr (std::is_same_v<typeB, nv_bfloat16>) {
+            size_t size = n*k;
+            // cast BF16 to FP8
+            if (matmul_scratch_size[1] < size) {
+                if (matmul_scratch[1] != NULL) {
+                    cudaCheck(cudaFree(matmul_scratch[1]));
+                }
+                cudaCheck(cudaMalloc(&matmul_scratch[1], size*sizeof(__nv_fp8_e4m3)));
+                matmul_scratch_size[1] = size;
+            }
+            copy_and_cast_kernel<__nv_fp8_e4m3><<<CEIL_DIV(size, 256), 256, 0, stream>>>((__nv_fp8_e4m3*)matmul_scratch[1], (nv_bfloat16*)b, size, 1, 1);
+            b = (typeB*)matmul_scratch[1];
+            BType = CUDA_R_8F_E4M3;
+        } else {
+            assert(false);
+        }
+    } else {
+        AType = CUDA_R_16BF;
+        BType = CUDA_R_16BF;
+        CType = CUDA_R_16BF;
         DType = CUDA_R_16BF;
-    } else {
-        // todo - do we need automatic conversion for other formats?
-        assert(false);
-    }
-    if constexpr (std::is_same_v<typeA, __nv_fp8_e4m3>) {
-        AType = CUDA_R_8F_E4M3;
-    } else if constexpr (std::is_same_v<typeA, __nv_fp8_e5m2>) {
-        AType = CUDA_R_8F_E5M2;
-    } else {
-        // TODO!!!
-        // todo - cast BF16 to FP8
-        return;
-        assert(false);
-    }
-    if constexpr (std::is_same_v<typeB, __nv_fp8_e4m3>) {
-        BType = CUDA_R_8F_E4M3;
-    } else if constexpr (std::is_same_v<typeB, __nv_fp8_e5m2>) {
-        BType = CUDA_R_8F_E5M2;
-    } else {
-        // todo - cast BF16 to FP8
-        assert(false);
+        BiasType = CUDA_R_16BF;
     }
 #endif
 
@@ -260,6 +295,15 @@ void matmul_cublaslt(typeD* d, const typeA* a, const typeB* b, const void* bias,
         printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d, sizeof(floatX): %lu, transA: %d, transB: %d, batch_count: %d, \
                 strideA: %lu, strideB: %lu, strideOut: %lu, accumulate: %d, pre_gelu: %p, backward: %d\n",
                 m, n, k, has_bias, sizeof(floatX), transA, transB, batch_count, strideA, strideB, strideOut, accumulate, pre_gelu, backward);
+        // print typeA/B/C/D, bias, etc.
+        printf("typeA: %s, typeB: %s, typeD: %s, BiasType: %s, AType: %s, BType: %s, CType: %s, DType: %s\n",
+                typeid(typeA).name(), typeid(typeB).name(), typeid(typeD).name(), typeid(BiasType).name(),
+                typeid(AType).name(), typeid(BType).name(), typeid(CType).name(), typeid(DType).name());
+        // print the actual BiasType/AType/etc. and CUBLAS_LOWP
+        printf("BiasType: %d, AType: %d, BType: %d, CType: %d, DType: %d, CUBLAS_LOWP: %d\n",
+                BiasType, AType, BType, CType, DType, CUBLAS_LOWP);
+        printf("transA: %d, transB: %d, accumulate: %d, has_bias: %d, has_gelu: %d, backward: %d\n",
+                transA, transB, accumulate, has_bias, has_gelu, backward);
         exit(EXIT_FAILURE);
     } else {
         /*
@@ -306,8 +350,8 @@ void matmul_forward_cublaslt(typeD* out,
     if (gelu_fusion < 1 && pre_gelu) {
         // check typeD is floatX
         if constexpr (std::is_same_v<typeD, floatX>) {
-            matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
-            gelu_forward(out, (floatX*)pre_gelu, B*T*OC, stream);
+            matmul_cublaslt((typeD*)pre_gelu, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, NULL, false);
+            gelu_forward(out, (typeD*)pre_gelu, B*T*OC, stream);
         } else {
             assert(false);
         }
