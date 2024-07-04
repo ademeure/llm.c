@@ -23,7 +23,7 @@ version 12 is a more optimized transpose with shared memory and 128-bit loads/st
 #include <cuda_fp8.h>
 
 //#define TRANSPOSE_AND_COPY true
-//#define SCALING_FACTOR 0.0f
+#define SCALING_FACTOR 1.5f
 
 #if !defined(TRANSPOSE_AND_COPY)
 #define TRANSPOSE_AND_COPY false
@@ -114,8 +114,8 @@ public:
         return GenericVector(address);
     }
 
-    static __host__ __device__ GenericVector store(ElementType* address) {
-
+    static __host__ __device__ void store(ElementType* address) {
+        // todo
     }
 
 private:
@@ -304,16 +304,16 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
     // 1) 128-bit shared memory stores need to be aligned to 128-bit boundaries
     // 2) it doesn't help as much with sub-32-bit data types
     __shared__ T1 tile[TILE_DIM][TILE_DIM];
-    int width = gridDim.x * TILE_DIM;
+    int width  = gridDim.x * TILE_DIM;
     int height = gridDim.y * TILE_DIM;
-
-    float scale_factor = scaling ? *scale_pointer : 1.0f;
-    int x = blockIdx.x * TILE_DIM + (threadIdx.x * (16 / sizeof(T2)));
-    int y = blockIdx.y * TILE_DIM + threadIdx.y;
 
     constexpr size_t T1_elements = 16 / sizeof(T1);
     constexpr size_t T2_elements = 16 / sizeof(T2);
     constexpr size_t copy_len = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
+
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
+    int x = blockIdx.x * TILE_DIM + (threadIdx.x * T2_elements);
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
 
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         Packed128<T2> in128 = load128<T2>(input + x + (y+j)*width);
@@ -334,24 +334,25 @@ __global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ 
     }
     __syncthreads();
 
-    // if sizeof(T1) < sizeof(T2), keep using 128-bit stores but with fewer active warps
-    constexpr size_t ratio = TILE_DIM / (16 / sizeof(T1));
-    if (threadIdx.y >= blockDim.y / ratio) {
+    // we need fewer threads for the write than the read if T1_elements > T2_elements
+    if (threadIdx.x >= TILE_DIM / T1_elements) {
         return;
     }
-    size_t adjusted_tid_x = threadIdx.x % ratio;
-    size_t adjusted_tid_y = (threadIdx.y * ratio) + (threadIdx.x / ratio);
-    x = blockIdx.y * TILE_DIM + (adjusted_tid_x * (16 / sizeof(T1)));
-    y = blockIdx.x * TILE_DIM + adjusted_tid_y;
+
+    x = blockIdx.y * TILE_DIM + threadIdx.x * T1_elements;
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
 
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        Packed128<T1> out128;
-        for (int k = 0; k < out128.size; k++) {
-            // these are tiny 8-bit loads with loads of bank conflicts for FP8
-            // extremely hard to avoid and not a bottleneck when everything else is well optimised
-            out128[k] = tile[k + adjusted_tid_x * out128.size][adjusted_tid_y + j];
+        // we need more instructions for the write than the read if T2_elements > T1_elements
+        for (int o = 0; o < copy_len; o++) {
+            Packed128<T1> out128;
+            for (int k = 0; k < out128.size; k++) {
+                // these are tiny 8-bit loads with loads of bank conflicts for FP8
+                // extremely hard to avoid and not a bottleneck when everything else is well optimised
+                out128[k] = tile[k + (threadIdx.x + o * blockDim.x) * out128.size][threadIdx.y + j];
+            }
+            store128<T1>(transposed + x + (o * blockDim.x * out128.size) + (y+j)*height, out128);
         }
-        store128<T1>(transposed + x + (y+j)*height, out128);
     }
 }
 
@@ -406,21 +407,24 @@ void transpose1(T1 *transposed, const T2 *input, size_t width, size_t height, co
     dim3 grid_size(width / DEFAULT_TILE, height / DEFAULT_TILE);
     dim3 block_size_(DEFAULT_TILE, block_size);
 
+    constexpr bool fused_copy = TRANSPOSE_AND_COPY;
+
     switch (block_size) {
-        case 32: transpose_kernel1<32, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(transposed, copy, input); break;
-        case 16: transpose_kernel1<16, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(transposed, copy, input); break;
-        case 8: transpose_kernel1<8, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(transposed, copy, input); break;
-        case 4: transpose_kernel1<4, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 32: transpose_kernel1<32, DEFAULT_TILE, SCALING, fused_copy><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 16: transpose_kernel1<16, DEFAULT_TILE, SCALING, fused_copy><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 8: transpose_kernel1<8, DEFAULT_TILE, SCALING, fused_copy><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 4: transpose_kernel1<4, DEFAULT_TILE, SCALING, fused_copy><<<grid_size, block_size_>>>(transposed, copy, input); break;
         default: printf("Invalid block size\n"); exit(1);
     }
 
-    if (TRANSPOSE_AND_COPY) {
+    if (TRANSPOSE_AND_COPY && !fused_copy) {
+        dim3 grid_size(height / DEFAULT_TILE, width / DEFAULT_TILE);
         cudaCheck(cudaGetLastError());
         switch (block_size) {
-            case 32: transpose_kernel1<32, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
-            case 16: transpose_kernel1<16, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
-            case 8: transpose_kernel1<8, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
-            case 4: transpose_kernel1<4, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 32: transpose_kernel1<32, DEFAULT_TILE, false, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 16: transpose_kernel1<16, DEFAULT_TILE, false, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 8: transpose_kernel1<8, DEFAULT_TILE, false, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 4: transpose_kernel1<4, DEFAULT_TILE, false, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
             default: printf("Invalid block size\n"); exit(1);
         }
     }
@@ -429,14 +433,29 @@ void transpose1(T1 *transposed, const T2 *input, size_t width, size_t height, co
 template <typename T1, typename T2>
 void transpose2(T1 *transposed, const T2 *input, size_t width, size_t height, const size_t block_size, T1 *copy=NULL) {
     dim3 grid_size(width / DEFAULT_TILE, height / DEFAULT_TILE);
-    dim3 block_size_(DEFAULT_TILE * sizeof(T2) / 16, block_size);
+    dim3 block_size_((DEFAULT_TILE * sizeof(T2)) / 16, block_size);
+
+    constexpr bool fused_copy = TRANSPOSE_AND_COPY;
 
     switch (block_size) {
-        case 32: transpose_kernel2<32><<<grid_size, block_size_>>>(transposed, copy, input); break;
-        case 16: transpose_kernel2<16><<<grid_size, block_size_>>>(transposed, copy, input); break;
-        case 8: transpose_kernel2<8><<<grid_size, block_size_>>>(transposed, copy, input); break;
-        case 4: transpose_kernel2<4><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 32: transpose_kernel2<32, DEFAULT_TILE, SCALING, fused_copy><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 16: transpose_kernel2<16, DEFAULT_TILE, SCALING, fused_copy><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 8: transpose_kernel2<8, DEFAULT_TILE, SCALING, fused_copy><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 4: transpose_kernel2<4, DEFAULT_TILE, SCALING, fused_copy><<<grid_size, block_size_>>>(transposed, copy, input); break;
         default: printf("Invalid block size\n"); exit(1);
+    }
+
+    if (TRANSPOSE_AND_COPY && !fused_copy) {
+        dim3 grid_size(height / DEFAULT_TILE, width / DEFAULT_TILE);
+        dim3 block_size_((DEFAULT_TILE * sizeof(T1)) / 16, block_size);
+        cudaCheck(cudaGetLastError());
+        switch (block_size) {
+            case 32: transpose_kernel2<32, DEFAULT_TILE, false, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 16: transpose_kernel2<16, DEFAULT_TILE, false, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 8: transpose_kernel2<8, DEFAULT_TILE, false, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 4: transpose_kernel2<4, DEFAULT_TILE, false, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            default: printf("Invalid block size\n"); exit(1);
+        }
     }
 }
 
@@ -480,7 +499,7 @@ int main(int argc, const char **argv) {
     setup_main();
 
     int W = 8192;
-    int H = 8192;
+    int H = 3072;
 
     // create host memory of random numbers
     OUT_TYPE* transposed = (OUT_TYPE*)malloc(W * H * sizeof(OUT_TYPE));
