@@ -1,228 +1,477 @@
 /*
 Kernels for transpose with format conversion
+Many parameters are configurable by changing the defines
 
-Compile example:
-nvcc -O3 --use_fast_math transpose.cu -o transpose
+Compile examples (change 90 to your SM architecture - do not trust performance without it):
+nvcc -O3 --generate-code arch=compute_90,code=[compute_90,sm_90] --use_fast_math transpose.cu -o transpose
+nvcc -DIN_TYPE=half -DOUT_TYPE=float -DSCALING_FACTOR=0.5f -DTRANSPOSE_AND_COPY=true -O3 --generate-code arch=compute_90,code=[compute_90,sm_90] --use_fast_math transpose.cu -o transpose
 
 version 0 is a non-optimized copy (not a transpose)
-version 1 is an optimized copy (not a transpose)
-version
-./transpose 1
+version 1 is an optimized copy
+version 2 is a different optimized copy
+
+version 10 is a non-optimized transpose
+version 11 is an optimized transpose with shared memory
+version 12 is a more optimized transpose with shared memory and 128-bit loads/stores
+
+./transpose 12
 */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <cuda_runtime.h>
-#include <cuda_fp8.h>
-
-#define ENABLE_BF16
 #define SKIP_CUBLAS
 #include "common.h"
+#include <cstring>
+#include <cuda_fp8.h>
+
+//#define TRANSPOSE_AND_COPY true
+//#define SCALING_FACTOR 0.0f
+
+#if !defined(TRANSPOSE_AND_COPY)
+#define TRANSPOSE_AND_COPY false
+#endif
 
 #if !defined(IN_TYPE)
 #define IN_TYPE __nv_bfloat16
 #endif
-
 #if !defined(OUT_TYPE)
 #define OUT_TYPE __nv_fp8_e4m3
 #endif
 
+float* d_scaling_factor = NULL;
+#if defined(SCALING_FACTOR)
+#define SCALING true
+#else
+#define SCALING_FACTOR 1.0f
+#define SCALING false
+#endif
+
+#define DEFAULT_TILE 32UL // transpose tile size currently can only be 32x32
+#define FIRST_TRANSPOSE_KERNEL 10 // kernels 0/1/2 are copy kernels without transpose
+
+/*
+using reduction_func_t = float (*) (float);
+
+template<reduction_func_t warp_reduction>
+__device__ inline float blockReduce(float val, bool final_sync, float out_of_bounds) {
+    // two reductions of up to 1024 threads:
+    // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
+    __shared__ float shared_val[WARP_SIZE];
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
+
+    float warp_val = warp_reduction(val);
+    if (lane_id == 0) { shared_val[warp_id] = warp_val; }
+    __syncthreads();
+    warp_val = (lane_id < num_warps) ? shared_val[lane_id] : out_of_bounds;
+    float block_val = warp_reduction(warp_val);
+
+    if (final_sync) {
+        __syncthreads(); // only needed in loops when effectively reusing shared memory etc.
+    }
+    return block_val;
+}
+*/
+
+// ----------------------------------------------------------------------------
+// This helper is for when we want to copy from e.g. FP32 to BF16
+// e.g. if want to load a f128 of 4 elements, and write those 4 elements to memory as 64-bit
+// not needed in the case of loads, the compiler will automatically optimise away unused reads
+// (we might want to replace this with something like a fixed vector width class)
+
+template<class OriginalType, class ElementType>
+__device__ void store_same_length(ElementType* target, Packed128<ElementType> value) {
+    int4 bits = value.get_bits();
+    switch (sizeof(OriginalType) / sizeof(ElementType)) {
+        case 0: *reinterpret_cast<int4*>(target) = bits; // smaller
+        case 1: *reinterpret_cast<int4*>(target) = bits; // same size
+        case 2: *reinterpret_cast<int2*>(target) = make_int2(bits.x, bits.y); break;
+        case 4: *reinterpret_cast<int*>(target) = bits.x; break;
+        default: break; //assert(false);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Helper from ngc92 to create vectors of specific size irrespective of type
+
+template<class ElementType, std::size_t ElementCount>
+class alignas(sizeof(ElementType) * ElementCount) GenericVector {
+    static_assert(std::is_trivial_v<ElementType>, "Only trivial types are supported");
+
+public:
+    GenericVector() = default;
+    constexpr __host__ __device__ ElementType& operator[](int index) {
+        return values[index];
+    }
+
+    constexpr __host__ __device__ const ElementType& operator[](int index) const {
+        return values[index];
+    }
+
+    static constexpr const std::size_t size = ElementCount;
+    static constexpr const std::size_t bytes = ElementCount * sizeof(ElementType);
+
+    static __host__ __device__ GenericVector load(const ElementType* address) {
+        return GenericVector(address);
+    }
+
+    static __host__ __device__ GenericVector store(ElementType* address) {
+
+    }
+
+private:
+    explicit __host__ __device__ GenericVector(const ElementType* address) {
+        if constexpr (bytes % sizeof(int4) == 0) {
+            const int4* read_address = reinterpret_cast<const int4*>(address);
+            for (int i = 0; i < bytes; i += sizeof(int4)) {
+                int4 val = *read_address;
+                ++read_address;
+                std::memcpy(values + i / sizeof(ElementType), &val, sizeof(int4));
+            }
+        } else if constexpr (bytes == sizeof(int2)) {
+            int2 val = *reinterpret_cast<const int2*>(address);
+            std::memcpy(values, &val, sizeof(int2));
+        } else if constexpr (bytes == sizeof(int1)) {
+            int1 val = *reinterpret_cast<const int1*>(address);
+            std::memcpy(values, &val, sizeof(int1));
+        } else {
+            std::copy(address, address + size, values);
+        }
+    }
+
+    ElementType values[size];
+};
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
-template <typename T1, typename T2>
-void transpose_cpu(T1* out, const T2* inp, size_t width, size_t height) {
+template <bool scaling=SCALING, typename T1, typename T2>
+void transpose_cpu(T1* transposed, const T2* input, size_t width, size_t height, T1* copy, float scaling_factor=SCALING_FACTOR) {
     for (size_t y = 0; y < height; y++) {
         for (size_t x = 0; x < width; x++) {
-            out[x * height + y] = (T1)((IN_TYPE)inp[y * width + x]);
+            // note (IN_TYPE) unlike GPU version because T2 is actually always float for simplicity
+            float in = (float)((IN_TYPE)input[x + y*width]);
+            if constexpr (scaling) { in *= scaling_factor; }
+
+            transposed[y + x * height] = (T1)in;
+            copy[x + y*width] = (T1)in;
         }
     }
 }
 
 // ----------------------------------------------------------------------------
-// GPU kernels
+// GPU kernels for copy
 
-template <typename T1, typename T2>
-__global__ void copy_kernel(T1 *out, const T2 *inp, size_t N) {
-    Packed128<T1> out128;
+template <bool scaling=SCALING, typename T1, typename T2>
+__global__ void copy_naive_kernel(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=d_scaling_factor) {
     size_t n = (blockIdx.x * blockDim.x + threadIdx.x);
     if (n >= N) { return; }
-    out[n] = (T1)inp[n];
+    copy[n] = scaling ? (T1)(*scale_pointer * (float)input[n]) : (T1)input[n];
 }
 
-template <typename T1, typename T2>
-__global__ void copy128_kernel(T1 *out, const T2 *inp, size_t N) {
-    Packed128<T1> out128;
-    size_t n = (blockIdx.x * blockDim.x + threadIdx.x) * out128.size;
+// overly complicated copy & format conversion kernel without store_same_length
+// this keeps all loads & stores 128-bit at the cost of more complexity and more register pressure
+template <bool scaling=SCALING, bool enable_copy=TRANSPOSE_AND_COPY, typename T1, typename T2>
+__global__ void copy128_kernel1(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=d_scaling_factor) {
+    size_t n = (blockIdx.x * blockDim.x + threadIdx.x) * Packed128<T1>::size;
     if (n >= N) { return; }
 
     // note: if sizeof(T1) < sizeof(T2), compiler will skip unused elements of load128
     // so it may turn out to be a load32 or load64
-    Packed128<T2> inp128 = load128<T2>(inp + n);
-    for (int i = 0; i < out128.size; i++) {
-        out128[i] = (T1)inp128[i];
+    Packed128<T2> inp128;
+    Packed128<T1> out128;
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
+    #pragma unroll
+    for (int o = 0; o < max(1, out128.size/inp128.size); o++) {
+        inp128 = load128<T2>(input + n + o*inp128.size);
+        #pragma unroll
+        for (int k = 0; k < min(inp128.size, out128.size); k++) {
+            if constexpr (scaling) {
+                out128[k+o*inp128.size] = (T1)((float)inp128[k] * scale_factor);
+            }  else {
+                out128[k+o*inp128.size] = (T1)inp128[k];
+            }
+        }
     }
-    store128<T1>(out + n, out128);
+    store128<T1>(copy + n, out128);
 }
 
-template <typename T1, typename T2>
-__global__ void transpose_kernel0(T1 *out, const T2 *inp, size_t width, size_t height) {
+// simplified copy & format conversion kernel using store_same_length
+// keeps the largest format at 128-bit and smallest at 32-bit or 64-bit
+template <bool scaling=SCALING, typename T1, typename T2>
+__global__ void copy128_kernel2(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=d_scaling_factor) {
+    // Calculate the *smallest* of the two vector sizes in terms of elements (both are 128-bit if fully used)
+    constexpr size_t vec_size = 16 / ((sizeof(T1) < sizeof(T2)) ? sizeof(T2) : sizeof(T1));
+
+    size_t fewest_elements = min(Packed128<T1>::size, Packed128<T2>::size);
+    size_t n = (blockIdx.x * blockDim.x + threadIdx.x) * vec_size;
+    if (n >= N) { return; }
+
+    // note: if sizeof(T1) < sizeof(T2), compiler will skip unused elements of load128
+    // so it may turn out to be a ldg.32 or ldg.64
+    Packed128<T2> inp128;
+    Packed128<T1> out128;
+    inp128 = load128<T2>(input + n);
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
+    for (int k = 0; k < vec_size; k++) {
+        if constexpr (scaling) {
+            out128[k] = (T1)((float)inp128[k] * scale_factor);
+        }  else {
+            out128[k] = (T1)inp128[k];
+        }
+    }
+    // if sizeof(T2) < sizeof(T1), this will use stg.32 or stg.64 instead of stg.128
+    store_same_length<T2,T1>(copy + n, out128);
+}
+
+// using ngc92's GenericVector to copy with format conversion
+template <bool scaling=SCALING, typename T1, typename T2>
+__global__ void copy_vec_kernel3(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer=d_scaling_factor) {
+    // Calculate the vector size required to use *at least* 128-bit loads and stores (one may be larger)
+    constexpr size_t vec_size = 16 / ((sizeof(T1) < sizeof(T2)) ? sizeof(T1) : sizeof(T2));
+
+    size_t n = (blockIdx.x * blockDim.x + threadIdx.x) * vec_size;
+    if (n >= N) { return; }
+
+    GenericVector<T2,vec_size> inpV = GenericVector<T2,vec_size>::load(input + n);
+    GenericVector<T1,vec_size> outV;
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
+    for (int k = 0; k < vec_size; k++) {
+        outV[k] = scaling ? (T1)((float)inpV[k] * scale_factor) : (T1)inpV[k];
+    }
+    outV.store(copy + n);
+}
+
+// ----------------------------------------------------------------------------
+// GPU kernels for transpose
+
+// naive transpose kernel without shared memory or 128-bit load/store
+template <bool scaling=SCALING, bool enable_copy=TRANSPOSE_AND_COPY, typename T1, typename T2>
+__global__ void transpose_naive_kernel(T1 *transposed, T1* copy, const T2 *input, size_t width, size_t height, const float* __restrict__ scale_pointer=d_scaling_factor) {
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
     size_t x = blockIdx.x * blockDim.x + threadIdx.x;
     size_t y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x < width && y < height) {
-        out[x * height + y] = (T1)inp[y * width + x];
+        T2 in = input[x + y * width];
+        T1 out = scaling ? (T1)((float)in * scale_factor) : (T1)in;
+
+        transposed[y + x*height] = out;
+        if constexpr (enable_copy) {
+            copy[x + y*width] = out;
+        }
     }
 }
 
-#define TILE_DIM 32UL
-template<size_t BLOCK_ROWS=8UL, typename T1, typename T2>
-__global__ void transpose_kernel1(T1 *odata, const T2 *idata)
+// optimized transpose kernel with shared memory but *without* 128-bit load/store
+// originally based on: https://github.com/NVIDIA-developer-blog/code-samples/blob/master/series/cuda-cpp/transpose/transpose.cu
+// also see this blog article: https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
+// note that neither of these sources consider less than 32-bit data formats (and associated bank conflicts)
+template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=DEFAULT_TILE, bool scaling=SCALING, bool enable_copy=TRANSPOSE_AND_COPY, typename T1, typename T2>
+__global__ void transpose_kernel1(T1 *transposed, T1 *copy, const T2 *input, const float* __restrict__ scale_pointer=d_scaling_factor)
 {
-    __shared__ T1 tile[TILE_DIM][TILE_DIM+1];
-
-    int x = blockIdx.x * TILE_DIM + threadIdx.x;
-    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+    __shared__ T1 tile[TILE_DIM][TILE_DIM+1]; // +1 for bank conflict avoidance
     int width = gridDim.x * TILE_DIM;
     int height = gridDim.y * TILE_DIM;
 
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-        tile[threadIdx.y+j][threadIdx.x] = (T1)idata[(y+j)*width + x];
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
 
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        T2 in = input[x + (y+j)*width];
+        T1 out = scaling ? (T1)((float)in * scale_factor) : (T1)in;
+
+        tile[threadIdx.y+j][threadIdx.x] = out;
+        if constexpr (enable_copy) {
+            copy[x + (y+j)*width] = out; // separate copy with format conversion (on top of the transpose)
+        }
+    }
     __syncthreads();
 
     x = blockIdx.y * TILE_DIM + threadIdx.x;  // transpose block offset
     y = blockIdx.x * TILE_DIM + threadIdx.y;
 
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-        odata[(y+j)*height + x] = tile[threadIdx.x][threadIdx.y + j];
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        // avoiding bank conflicts for 32-bit data types thanks to +1 below (also seems to help sub-32-bit but less)
+        transposed[x + (y+j)*height] = tile[threadIdx.x][threadIdx.y + j];
+    }
 }
 
-template<size_t BLOCK_ROWS=8UL, typename T1, typename T2>
-__global__ void transpose_kernel2(T1 *odata, const T2 *idata)
+// more optimized transpose kernel using 128-bit load/store and shared memory
+template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=DEFAULT_TILE, bool scaling=SCALING, bool enable_copy=TRANSPOSE_AND_COPY, typename T1, typename T2>
+__global__ void transpose_kernel2(T1* __restrict__ transposed, T1* __restrict__ copy, const T2* __restrict__ input, const float* __restrict__ scale_pointer=d_scaling_factor)
 {
-    __shared__ T1 tile[TILE_DIM][TILE_DIM+1];
-
-    int x = blockIdx.x * TILE_DIM + (threadIdx.x * (16 / sizeof(T2)));
-    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+    // no +1 for bank conflict avoidance because:
+    // 1) 128-bit shared memory stores need to be aligned to 128-bit boundaries
+    // 2) it doesn't help as much with sub-32-bit data types
+    __shared__ T1 tile[TILE_DIM][TILE_DIM];
     int width = gridDim.x * TILE_DIM;
     int height = gridDim.y * TILE_DIM;
 
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
+    int x = blockIdx.x * TILE_DIM + (threadIdx.x * (16 / sizeof(T2)));
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+
+    constexpr size_t T1_elements = 16 / sizeof(T1);
+    constexpr size_t T2_elements = 16 / sizeof(T2);
+    constexpr size_t copy_len = (sizeof(T1) >= sizeof(T2)) ? (sizeof(T1) / sizeof(T2)) : 1;
+
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        Packed128<T2> in128 = load128<T2>(idata + (y+j)*width + x);
+        Packed128<T2> in128 = load128<T2>(input + x + (y+j)*width);
+        Packed128<T1> copy128[copy_len];
         for (int k = 0; k < in128.size; k++) {
-            tile[threadIdx.y+j][threadIdx.x * in128.size + k] = (T1)in128[k];
+            T2 in = in128[k];
+            T1 out = scaling ? (T1)((float)in * scale_factor) : (T1)in;
+            copy128[k/T1_elements][k%T1_elements] = out; // optimised away by compiler if unused
+        }
+
+        for (int o = 0; o < copy_len; o++) {
+            if constexpr (enable_copy) {
+                store_same_length<T2,T1>(copy + x + (y+j)*width + o*T1_elements, copy128[o]);
+            }
+            size_t tile_offset = (threadIdx.x * T2_elements) + (threadIdx.y+j)*TILE_DIM + o*T1_elements;
+            store_same_length<T2,T1>(&tile[0][0] + tile_offset, copy128[o]);
         }
     }
-
     __syncthreads();
 
-    // this is... not ideal performance-wise, especially for big differences in sizes
-    if (threadIdx.x > TILE_DIM / (16 / sizeof(T1))) {
+    // if sizeof(T1) < sizeof(T2), keep using 128-bit stores but with fewer active warps
+    constexpr size_t ratio = TILE_DIM / (16 / sizeof(T1));
+    if (threadIdx.y >= blockDim.y / ratio) {
         return;
     }
-
-    x = blockIdx.y * TILE_DIM + (threadIdx.x * (16 / sizeof(T1)));  // transpose block offset
-    y = blockIdx.x * TILE_DIM + threadIdx.y;
+    size_t adjusted_tid_x = threadIdx.x % ratio;
+    size_t adjusted_tid_y = (threadIdx.y * ratio) + (threadIdx.x / ratio);
+    x = blockIdx.y * TILE_DIM + (adjusted_tid_x * (16 / sizeof(T1)));
+    y = blockIdx.x * TILE_DIM + adjusted_tid_y;
 
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         Packed128<T1> out128;
         for (int k = 0; k < out128.size; k++) {
-            out128[k] = tile[threadIdx.x * out128.size + k][threadIdx.y + j];
+            // these are tiny 8-bit loads with loads of bank conflicts for FP8
+            // extremely hard to avoid and not a bottleneck when everything else is well optimised
+            out128[k] = tile[k + adjusted_tid_x * out128.size][adjusted_tid_y + j];
         }
-        store128<T1>(odata + (y+j)*height + x, out128);
+        store128<T1>(transposed + x + (y+j)*height, out128);
     }
 }
 
 // ----------------------------------------------------------------------------
-// kernel launcher
+// kernel launchers
 
 template <typename T1, typename T2>
-void copy(T1* out, const T2* inp, size_t width, size_t height, const size_t block_size) {
+void copy_naive(T1 *copy, const T2 *input, size_t width, size_t height, const size_t block_size) {
     size_t N = width * height;
-    const dim3 grid_size(ceil_div(N, block_size*block_size), 1);
+    const dim3 grid_size(ceil_div(N, block_size*block_size));
     const dim3 block_size_(block_size*block_size);
-    copy_kernel<<<grid_size, block_size_>>>(out, inp, N);
+    copy_naive_kernel<<<grid_size, block_size_>>>(copy, input, N);
 }
 
 template <typename T1, typename T2>
-void copy128(T1* out, const T2* inp, size_t width, size_t height, const size_t block_size) {
+void copy128_1(T1 *copy, const T2 *input, size_t width, size_t height, const size_t block_size) {
     size_t N = width * height;
-    const dim3 grid_size(ceil_div(N, block_size*block_size * (16 / sizeof(T1))), 1);
+    const dim3 grid_size(ceil_div(N, block_size*block_size * 16 / sizeof(T1)));
     const dim3 block_size_(block_size*block_size);
-    copy128_kernel<<<grid_size, block_size_>>>(out, inp, N);
+    copy128_kernel1<<<grid_size, block_size_>>>(copy, input, N);
 }
 
 template <typename T1, typename T2>
-void transpose0(T1* out, const T2* inp, size_t width, size_t height, const size_t block_size) {
+void copy128_2(T1 *copy, const T2 *input, size_t width, size_t height, const size_t block_size) {
+    size_t N = width * height;
+    size_t fewest_elements = min(Packed128<T1>::size, Packed128<T2>::size);
+    const dim3 grid_size(ceil_div(N, block_size*block_size * fewest_elements));
+    const dim3 block_size_(block_size*block_size);
+    copy128_kernel2<<<grid_size, block_size_>>>(copy, input, N);
+}
+
+template <typename T1, typename T2>
+void copy_vec_3(T1 *copy, const T2 *input, size_t width, size_t height, const size_t block_size) {
+    // Calculate the vector size required to use at least 128-bit for both loads and stores
+    constexpr size_t vec_size = 16 / ((sizeof(T1) < sizeof(T2)) ? sizeof(T1) : sizeof(T2));
+
+    size_t N = width * height;
+    const dim3 grid_size(ceil_div(N, block_size*block_size * vec_size));
+    const dim3 block_size_(block_size*block_size);
+    copy_vec_kernel3<<<grid_size, block_size_>>>(copy, input, N);
+}
+
+template <typename T1, typename T2>
+void transpose_naive(T1 *transposed, const T2 *input, size_t width, size_t height, const size_t block_size, T1 *copy=NULL) {
     const dim3 grid_size(ceil_div(width, block_size), ceil_div(height, block_size));
     const dim3 block_size_(block_size, block_size);
-    transpose_kernel0<<<grid_size, block_size_>>>(out, inp, width, height);
-    cudaCheck(cudaGetLastError());
+    transpose_naive_kernel<<<grid_size, block_size_>>>(transposed, copy, input, width, height);
 }
 
 template <typename T1, typename T2>
-void transpose1(T1* out, const T2* inp, size_t width, size_t height, const size_t block_size) {
-    dim3 grid_size(width/(TILE_DIM), height/(TILE_DIM), 1);
-    dim3 block_size_(TILE_DIM, block_size, 1);
-    if (block_size == 32) {
-        transpose_kernel1<32><<<grid_size, block_size_>>>(out, inp);
-    } else if (block_size == 16) {
-        transpose_kernel1<16><<<grid_size, block_size_>>>(out, inp);
-    } else if (block_size == 8) {
-        transpose_kernel1<8><<<grid_size, block_size_>>>(out, inp);
-    } else if (block_size == 4) {
-        transpose_kernel1<4><<<grid_size, block_size_>>>(out, inp);
-    } else {
-        printf("Invalid block size\n");
-        exit(1);
+void transpose1(T1 *transposed, const T2 *input, size_t width, size_t height, const size_t block_size, T1 *copy=NULL) {
+    dim3 grid_size(width / DEFAULT_TILE, height / DEFAULT_TILE);
+    dim3 block_size_(DEFAULT_TILE, block_size);
+
+    switch (block_size) {
+        case 32: transpose_kernel1<32, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 16: transpose_kernel1<16, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 8: transpose_kernel1<8, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 4: transpose_kernel1<4, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        default: printf("Invalid block size\n"); exit(1);
     }
-    cudaCheck(cudaGetLastError());
+
+    if (TRANSPOSE_AND_COPY) {
+        cudaCheck(cudaGetLastError());
+        switch (block_size) {
+            case 32: transpose_kernel1<32, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 16: transpose_kernel1<16, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 8: transpose_kernel1<8, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            case 4: transpose_kernel1<4, DEFAULT_TILE, SCALING, false><<<grid_size, block_size_>>>(copy, copy, transposed); break;
+            default: printf("Invalid block size\n"); exit(1);
+        }
+    }
 }
 
 template <typename T1, typename T2>
-void transpose2(T1* out, const T2* inp, size_t width, size_t height, const size_t block_size) {
-    dim3 grid_size(width/(TILE_DIM), height/(TILE_DIM), 1);
-    dim3 block_size_(TILE_DIM / (16 / sizeof(T2)), block_size, 1);
-    if (block_size == 32) {
-        transpose_kernel2<32><<<grid_size, block_size_>>>(out, inp);
-    } else if (block_size == 16) {
-        transpose_kernel2<16><<<grid_size, block_size_>>>(out, inp);
-    } else if (block_size == 8) {
-        transpose_kernel2<8><<<grid_size, block_size_>>>(out, inp);
-    } else if (block_size == 4) {
-        transpose_kernel2<4><<<grid_size, block_size_>>>(out, inp);
-    } else {
-        printf("Invalid block size\n");
-        exit(1);
+void transpose2(T1 *transposed, const T2 *input, size_t width, size_t height, const size_t block_size, T1 *copy=NULL) {
+    dim3 grid_size(width / DEFAULT_TILE, height / DEFAULT_TILE);
+    dim3 block_size_(DEFAULT_TILE * sizeof(T2) / 16, block_size);
+
+    switch (block_size) {
+        case 32: transpose_kernel2<32><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 16: transpose_kernel2<16><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 8: transpose_kernel2<8><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 4: transpose_kernel2<4><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        default: printf("Invalid block size\n"); exit(1);
     }
-    cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
 template <typename T1, typename T2>
 void transpose(int kernel_num,
-              T1* out, const T2* inp,
+              T1 *transposed, T1 *copy, const T2 *input,
               size_t width, size_t height, size_t block_size) {
     switch (kernel_num) {
         case 0:
-            copy(out, inp, width, height, block_size);
+            copy_naive(copy, input, width, height, block_size);
             break;
         case 1:
-            copy128(out, inp, width, height, block_size);
+            copy128_1(copy, input, width, height, block_size);
+            break;
+        case 2:
+            copy128_2(copy, input, width, height, block_size);
+            break;
+        case 3:
+            copy_vec_3(copy, input, width, height, block_size);
             break;
         case 10:
-            transpose0(out, inp, width, height, block_size);
+            transpose_naive(transposed, input, width, height, block_size, copy);
             break;
         case 11:
-            transpose1(out, inp, width, height, block_size);
+            transpose1(transposed, input, width, height, block_size, copy);
             break;
         case 12:
-            transpose2(out, inp, width, height, block_size);
+            transpose2(transposed, input, width, height, block_size, copy);
             break;
         default:
             printf("Invalid kernel number\n");
             exit(1);
     }
+    cudaCheck(cudaGetLastError());
 }
 
 // ----------------------------------------------------------------------------
@@ -234,34 +483,49 @@ int main(int argc, const char **argv) {
     int H = 8192;
 
     // create host memory of random numbers
+    OUT_TYPE* transposed = (OUT_TYPE*)malloc(W * H * sizeof(OUT_TYPE));
+    OUT_TYPE* copy = (OUT_TYPE*)malloc(W * H * sizeof(OUT_TYPE));
     OUT_TYPE* out = (OUT_TYPE*)malloc(W * H * sizeof(OUT_TYPE));
-    float* inp = make_random_float_01(W * H);
+    float* input = make_random_float_01(W * H);
 
     // read kernel_num from command line
-    int kernel_num = 1;
+    int kernel_num = 12;
     if (argc > 1) {
         kernel_num = atoi(argv[1]);
     }
     printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
-    transpose_cpu(out, inp, W, H);
+    transpose_cpu(transposed, input, W, H, copy);
 
     // move to GPU
-    IN_TYPE *d_inp;
-    OUT_TYPE *d_out;
-    cudaCheck(cudaMalloc(&d_out, W * H * sizeof(OUT_TYPE)));
-    cudaCheck(cudaMalloc(&d_inp, W * H * sizeof(IN_TYPE)));
-    cudaCheck(memcpy_convert(d_inp, inp, W * H));
+    IN_TYPE *d_input;
+    OUT_TYPE *d_transposed, *d_copy;
+    cudaCheck(cudaMalloc(&d_transposed, W * H * sizeof(OUT_TYPE)));
+    cudaCheck(cudaMalloc(&d_copy, W * H * sizeof(OUT_TYPE)));
+    cudaCheck(cudaMalloc(&d_input, W * H * sizeof(IN_TYPE)));
+    cudaCheck(memcpy_convert(d_input, input, W * H));
 
-    // time the kernel at different block sizes
-    int block_sizes[] = {4, 8, 16, 32};
+    float scaling_factor = SCALING_FACTOR;
+    cudaCheck(cudaMalloc(&d_scaling_factor, sizeof(float)));
+    cudaCheck(cudaMemcpy(d_scaling_factor, &scaling_factor, sizeof(float), cudaMemcpyHostToDevice));
+
+    // time the kernel at different (squares of) block sizes
+    int block_sizes[] = {4,8,16,32};
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
-        printf("Checking block size %d.\n", block_size);
-        transpose(kernel_num, d_out, d_inp, W, H, block_size);
-        if (kernel_num >= 10) {
-            validate_result(d_out, out, "out", W * H, (OUT_TYPE)1e-5f);
+        printf("Checking block size %d(^2).\n", block_size);
+        transpose(kernel_num, d_transposed, d_copy, d_input, W, H, block_size);
+
+        // check copy tensor for copy kernels & for all others in +copy mode
+        #if TRANSPOSE_AND_COPY == false
+        if (kernel_num < FIRST_TRANSPOSE_KERNEL)
+        #endif
+            validate_result(d_copy, copy, "copy", W * H, (OUT_TYPE)1e-5f);
+
+        // check transposed tensor for transpose kernels
+        if (kernel_num >= FIRST_TRANSPOSE_KERNEL) {
+            validate_result(d_transposed, transposed, "transposed", W * H, (OUT_TYPE)1e-5f);
         }
     }
     printf("All results match. Starting benchmarks.\n\n");
@@ -270,18 +534,25 @@ int main(int argc, const char **argv) {
         int block_size = block_sizes[j];
         int repeat_times = 1000;
         float elapsed_time = benchmark_kernel(repeat_times, transpose<OUT_TYPE, IN_TYPE>,
-                                              kernel_num, d_out, d_inp,
+                                              kernel_num, d_transposed, d_copy, d_input,
                                               W, H, block_size);
 
         // napkin math: estimate the memory bandwidth achieved
         size_t memory_ops = W * H * (sizeof(IN_TYPE) + sizeof(OUT_TYPE));
+        #if TRANSPOSE_AND_COPY == true
+        if (kernel_num >= FIRST_TRANSPOSE_KERNEL) {
+            memory_ops += W * H * sizeof(OUT_TYPE);
+        }
+        #endif
         float memory_bandwidth = memory_ops / elapsed_time / 1e6;
-
-        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
+        printf("block_size %4d(^2) | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
     }
 
     free(out);
-    free(inp);
-    cudaCheck(cudaFree(d_inp));
-    cudaCheck(cudaFree(d_out));
+    free(copy);
+    free(input);
+    cudaCheck(cudaFree(d_input));
+    cudaCheck(cudaFree(d_copy));
+    cudaCheck(cudaFree(d_transposed));
+    cudaCheck(cudaFree(d_scaling_factor));
 }

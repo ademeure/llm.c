@@ -107,8 +107,118 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 // ============================================================================
 
 #define ABSMAX_OUTER_LOOP 4
-
 typedef Packed128<__nv_fp8_e4m3> e4m3_128;
+
+#define ABSMAX_OUTER_LOOP 4
+
+template <typename T>
+__global__ void get_absmax_kernel(const T* inp, float* absmax_scalar, size_t N, float extra_ratio=1.0f) {
+    size_t idx = ((blockIdx.x * blockDim.x * ABSMAX_OUTER_LOOP) + threadIdx.x) * x128::size;
+    float absmax = 0.0f;
+
+    if (idx < N) {
+        for (int i = 0; i < ABSMAX_OUTER_LOOP; i++) {
+            for (int k = 0; k < x128::size; ++k) {
+                float x = (float)inp[idx + k];
+                absmax = max(absmax, fabs(x));
+            }
+            idx += blockDim.x * x128::size;
+        }
+    }
+    absmax = blockReduce<warpReduceMax>(absmax);
+
+    if (threadIdx.x == 0) {
+        absmax = powf(2.0f, floorf(log2f(absmax))); // Round to previous power of 2
+        atomicMax((unsigned int*)absmax_scalar, __float_as_uint(absmax));
+    }
+}
+
+__global__ void get_absmax_kernel(const floatX* inp, float* absmax_scalar, size_t N, float extra_ratio=1.0f) {
+    size_t idx = ((blockIdx.x * blockDim.x * ABSMAX_OUTER_LOOP) + threadIdx.x) * x128::size;
+    uint absmax_uint = 0;
+
+    if (idx < N) {
+        #pragma unroll
+        for (int i = 0; i < ABSMAX_OUTER_LOOP; i++) {
+            x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
+            for(int k = 0; k < packed_inp.size; ++k) {
+                uint x = __float_as_uint((float)packed_inp[k] * extra_ratio) & 0x7f800000;
+                absmax_uint = max(absmax_uint, x);
+            }
+            idx += blockDim.x * x128::size;
+        }
+    }
+    // Use inline PTX for redux.sync.max.u32
+    uint lane_id = threadIdx.x % 32;
+    uint warp_id = threadIdx.x / 32;
+
+    asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
+    __shared__ uint tmp[32];
+    if (lane_id == 0) {
+        tmp[warp_id] = absmax_uint;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        absmax_uint = tmp[lane_id];
+        // printf max for this blockidx
+        if (lane_id == 0) {
+            asm volatile("redux.sync.max.u32 %0, %0, 0xff;" : "+r"(absmax_uint));
+            atomicMax((unsigned int*)absmax_scalar, absmax_uint);
+        }
+    }
+}
+
+template <typename T>
+void get_absmax(const T* inp, float* absmax_scalar, bool memset, size_t N, float extra_ratio=1.0f, cudaStream_t stream=0) {
+    NVTX_RANGE_FN();
+    size_t block_size = 1024;
+    assert((N % (x128::size * ABSMAX_OUTER_LOOP)) == 0);
+    size_t grid_size = CEIL_DIV(N, block_size * x128::size * ABSMAX_OUTER_LOOP);
+
+    if (memset) {
+        cudaMemset(absmax_scalar, 0, sizeof(float));
+    }
+    //get_absmax_kernel<<<grid_size, block_size, 0, stream>>>(inp, absmax_scalar, N, extra_ratio);
+
+    //grid_size = 2 * deviceProp.multiProcessorCount;
+    get_absmax_kernel<<<grid_size, block_size, 0, stream>>>(inp, absmax_scalar, N, extra_ratio);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================================
+
+#define SCALE_OUTER_LOOP 2
+
+template <typename T>
+__global__ void scale_tensor_kernel(T* out, const floatX* inp, float* scaleptr, bool reciprocal) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size * SCALE_OUTER_LOOP;
+
+    float scale = *scaleptr;
+    if(reciprocal) {
+        scale = 1.0f / scale;
+    }
+
+    for (int i = 0; i < SCALE_OUTER_LOOP; i++, idx += x128::size) {
+        x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
+        for(int k = 0; k < packed_inp.size; ++k) {
+            float x = (float)packed_inp[k];
+            out[idx + k] = (T)(x * scale);
+        }
+    }
+}
+
+template <typename T>
+void scale_tensor(T* out, const floatX* inp, float* scaleptr, bool reciprocal, int N, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    const int block_size = 64;
+    assert(N % (block_size * x128::size * SCALE_OUTER_LOOP) == 0);
+    const int grid_size = CEIL_DIV(N, block_size * x128::size * SCALE_OUTER_LOOP);
+
+    scale_tensor_kernel<<<grid_size, block_size, 0, stream>>>(out, inp, scaleptr, reciprocal);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================================
 
 __global__ void __launch_bounds__(256, 8) fused_absmax_scale_3(__nv_fp8_e4m3* out, const __nv_bfloat16* inp, float* absmax_scalar, unsigned char* absmax_vector, size_t N, float extra_ratio=1.0f) {
     __shared__ uint tmp[8];
@@ -257,41 +367,6 @@ __global__ void __launch_bounds__(512, 4) rescale_kernel_multi(__nv_fp8_e4m3* in
     }
 }
 
-template <bool scaled=false, typename T1, typename T2>
-__global__ void copy128_kernel(T1 *out, const T2 *inp, size_t N, float scale_factor) {
-    Packed128<T1> out128;
-    size_t n = (blockIdx.x * blockDim.x + threadIdx.x) * out128.size;
-    if (n >= N) { return; }
-
-    // note: if sizeof(T1) < sizeof(T2), compiler will skip unused elements of load128
-    // so it may turn out to be a load32 or load64
-    Packed128<T2> inp128;
-    for (int o = 0; o < max(1UL, out128.size/inp128.size); o++) {
-        inp128 = load128<T2>(inp + n + o*inp128.size);
-        for (int k = 0; k < min(inp128.size, out128.size); k++) {
-            if constexpr (scaled) {
-                out128[k+o*inp128.size] = (T1)((float)inp128[k] * scale_factor);
-            } else {
-                out128[k+o*inp128.size] = (T1)inp128[k];
-            }
-        }
-    }
-    store128<T1>(out + n, out128);
-}
-
-template <typename T1, typename T2>
-void copy128(T1* out, const T2* inp, size_t N, float scale_factor=1.0f) {
-    constexpr size_t block_size = 64;
-    size_t elements_per_block = block_size * 16 / sizeof(T1);
-    assert(N % elements_per_block == 0);
-
-    if (scale_factor != 1.0f) {
-        copy128_kernel<true><<<dim3(N / elements_per_block), dim3(block_size)>>>(out, inp, N, scale_factor);
-    } else {
-        copy128_kernel<false><<<dim3(N / elements_per_block), dim3(block_size)>>>(out, inp, N, 1.0f);
-    }
-}
-
 void get_absmax_and_scale(__nv_fp8_e4m3* out, const floatX* inp, float* absmax_global, unsigned char* absmax_vector, bool memset, size_t N, float extra_ratio=1.0f, cudaStream_t stream=0) {
     NVTX_RANGE_FN();
     size_t block_size = 256;
@@ -329,6 +404,149 @@ void get_absmax_and_scale(__nv_fp8_e4m3* out, const floatX* inp, float* absmax_g
     cudaCheck(cudaGetLastError());
 }
 
+// ============================================================================
+
+#define DEFAULT_TILE 32UL
+
+// optimized transpose kernel with shared memory but *without* 128-bit load/store
+// originally based on: https://github.com/NVIDIA-developer-blog/code-samples/blob/master/series/cuda-cpp/transpose/transpose.cu
+// also see this blog article: https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
+// note that neither of these sources consider less than 32-bit data formats (and associated bank conflicts)
+template<size_t BLOCK_ROWS=8UL, size_t TILE_DIM=DEFAULT_TILE, bool scaling=false, bool enable_copy=false, typename T1, typename T2>
+__global__ void transpose_kernel1(T1 *transposed, T1 *copy, const T2 *input, const float* __restrict__ scale_pointer=NULL)
+{
+    __shared__ T1 tile[TILE_DIM][TILE_DIM+1]; // +1 for bank conflict avoidance
+    int width = gridDim.x * TILE_DIM;
+    int height = gridDim.y * TILE_DIM;
+
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        T2 in = input[x + (y+j)*width];
+        T1 out = scaling ? (T1)((float)in * scale_factor) : (T1)in;
+
+        tile[threadIdx.y+j][threadIdx.x] = out;
+        if constexpr (enable_copy) {
+            //copy[x + (y+j)*width] = out; // separate copy with format conversion (on top of the transpose)
+        }
+    }
+    __syncthreads();
+
+    x = blockIdx.y * TILE_DIM + threadIdx.x;  // transpose block offset
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        // avoiding bank conflicts for 32-bit data types thanks to +1 below (also seems to help sub-32-bit but less)
+        transposed[x + (y+j)*height] = tile[threadIdx.x][threadIdx.y + j];
+    }
+}
+
+template <typename T1, typename T2>
+void transpose1(T1 *transposed, const T2 *input, size_t width, size_t height, const size_t block_size, T1 *copy=NULL) {
+    dim3 grid_size(width / DEFAULT_TILE, height / DEFAULT_TILE);
+    dim3 block_size_(DEFAULT_TILE, block_size);
+
+    switch (block_size) {
+        case 32: transpose_kernel1<32><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 16: transpose_kernel1<16><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 8: transpose_kernel1<8><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        case 4: transpose_kernel1<4><<<grid_size, block_size_>>>(transposed, copy, input); break;
+        default: printf("Invalid block size\n"); exit(1);
+    }
+}
+
+// ============================================================================
+
+template<class OriginalType, class ElementType>
+__device__ void store_same_length(ElementType* target, Packed128<ElementType> value) {
+    int4 bits = value.get_bits();
+    switch (sizeof(OriginalType) / sizeof(ElementType)) {
+        case 0: *reinterpret_cast<int4*>(target) = bits; // smaller
+        case 1: *reinterpret_cast<int4*>(target) = bits; // same size
+        case 2: *reinterpret_cast<int2*>(target) = make_int2(bits.x, bits.y); break;
+        case 4: *reinterpret_cast<int*>(target) = bits.x; break;
+        default: break; //assert(false);
+    }
+}
+
+// simplified copy & format conversion kernel using store_same_length
+// keeps the largest format at 128-bit and smallest at 32-bit or 64-bit
+template <bool scaling=true, typename T1, typename T2>
+__global__ void copy128_kernel2(T1 *copy, const T2 *input, size_t N, const float* __restrict__ scale_pointer) {
+    // Calculate the *smallest* of the two vector sizes in terms of elements (both are 128-bit if fully used)
+    constexpr size_t vec_size = 16 / ((sizeof(T1) < sizeof(T2)) ? sizeof(T2) : sizeof(T1));
+
+    size_t fewest_elements = min(Packed128<T1>::size, Packed128<T2>::size);
+    size_t n = (blockIdx.x * blockDim.x + threadIdx.x) * vec_size;
+    if (n >= N) { return; }
+
+    // note: if sizeof(T1) < sizeof(T2), compiler will skip unused elements of load128
+    // so it may turn out to be a ldg.32 or ldg.64
+    Packed128<T2> inp128;
+    Packed128<T1> out128;
+    inp128 = load128<T2>(input + n);
+    float scale_factor = scaling ? *scale_pointer : 1.0f;
+    for (int k = 0; k < vec_size; k++) {
+        if constexpr (scaling) {
+            out128[k] = (T1)((float)inp128[k] * scale_factor);
+        }  else {
+            out128[k] = (T1)inp128[k];
+        }
+    }
+    // if sizeof(T2) < sizeof(T1), this will use stg.32 or stg.64 instead of stg.128
+    store_same_length<T2,T1>(copy + n, out128);
+}
+
+template <bool scaled=false, typename T1, typename T2>
+__global__ void copy128_kernel(T1 *out, const T2 *inp, size_t N, float scale_factor) {
+    Packed128<T1> out128;
+    size_t n = (blockIdx.x * blockDim.x + threadIdx.x) * out128.size;
+    if (n >= N) { return; }
+
+    // note: if sizeof(T1) < sizeof(T2), compiler will skip unused elements of load128
+    // so it may turn out to be a load32 or load64
+    Packed128<T2> inp128;
+    for (int o = 0; o < max(1UL, out128.size/inp128.size); o++) {
+        inp128 = load128<T2>(inp + n + o*inp128.size);
+        for (int k = 0; k < min(inp128.size, out128.size); k++) {
+            if constexpr (scaled) {
+                out128[k+o*inp128.size] = (T1)((float)inp128[k] * scale_factor);
+            } else {
+                out128[k+o*inp128.size] = (T1)inp128[k];
+            }
+        }
+    }
+    store128<T1>(out + n, out128);
+}
+
+template <typename T1, typename T2>
+void copy128(T1* out, const T2* inp, size_t N, float scale_factor=1.0f) {
+    constexpr size_t block_size = 64;
+    size_t elements_per_block = block_size * 16 / sizeof(T1);
+    assert(N % elements_per_block == 0);
+
+    if (scale_factor != 1.0f) {
+        copy128_kernel2<true><<<dim3(N / elements_per_block), dim3(block_size)>>>(out, inp, N, scale_factor);
+    } else {
+        copy128_kernel2<false><<<dim3(N / elements_per_block), dim3(block_size)>>>(out, inp, N, 1.0f);
+    }
+}
+
+template <typename T1, typename T2>
+void copy128_old(T1* out, const T2* inp, size_t N, float scale_factor=1.0f) {
+    constexpr size_t block_size = 64;
+    size_t elements_per_block = block_size * 16 / sizeof(T1);
+    assert(N % elements_per_block == 0);
+
+    if (scale_factor != 1.0f) {
+        copy128_kernel<true><<<dim3(N / elements_per_block), dim3(block_size)>>>(out, inp, N, scale_factor);
+    } else {
+        copy128_kernel<false><<<dim3(N / elements_per_block), dim3(block_size)>>>(out, inp, N, 1.0f);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -337,7 +555,7 @@ float initial_absmax[2] = {1.0f, 1.0f};
 
 // Wrapper around cublasLtMatmul that is meant to support everything we need in llm.c
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
-void matmul_cublaslt(floatX* d, floatX* a, floatX* b, const floatX* bias,
+void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* bias,
                      int m, int n, int k, cudaStream_t stream=0, bool transA=true, bool transB=false,
                      int batch_count=0, size_t strideA=0, size_t strideB=0, size_t strideOut=0,
                      bool accumulate=false, floatX* pre_gelu=NULL, bool backward=false, bool allow_fp8=true)
@@ -360,15 +578,10 @@ void matmul_cublaslt(floatX* d, floatX* a, floatX* b, const floatX* bias,
     cublasLtMatmulPreference_t preference;
     cublasLtMatmulHeuristicResult_t heuristic;
 
-    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
-    cublasOperation_t opTranspose = CUBLAS_OP_T;
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, (transA)  ? &opTranspose : &opNoTranspose,   sizeof(opTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, (transB) ? &opTranspose   : &opNoTranspose, sizeof(opNoTranspose)));
-
     // todo - hack - this memory shouldn't be allocated here, obviously...
     static void* huge_scratch = NULL;
     static size_t huge_scratch_size = 0;
-    size_t needed_size = 128 + 2 * max(m*k, n*k) * sizeof(float) + 2 * max(m*k, n*k) * sizeof(float); // todo - wrong, too big
+    size_t needed_size = 128 + 4 * max(m*k, n*k) * sizeof(float) + 4 * max(m*k, n*k) * sizeof(float); // todo - wrong, too big
     if (huge_scratch_size < needed_size) {
         if (huge_scratch_size > 0) {
             cudaCheck(cudaFree(huge_scratch));
@@ -378,30 +591,81 @@ void matmul_cublaslt(floatX* d, floatX* a, floatX* b, const floatX* bias,
         cudaCheck(cudaMalloc(&huge_scratch, huge_scratch_size));
     }
 
-    auto input_precision = CUBLAS_LOWP;
+    auto a_precision = CUBLAS_LOWP;
+    auto b_precision = CUBLAS_LOWP;
     #ifdef FORCE_FP8_MATMUL
-    if (transA && !transB && batch_count == 0 && allow_fp8) {
-        input_precision = CUDA_R_8F_E4M3;
+    if (batch_count == 0 && !transB) {
+        a_precision = CUDA_R_8F_E4M3;
         int8_t fast_accum = 1;
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum, sizeof(fast_accum)));
 
         // Get absmax for a and b
         size_t absmax_size = CEIL_DIV(8*max(n*k,m*k), 256 * 8 * x128::size);
-        size_t rounded_to_128a = CEIL_DIV(128+absmax_size, 128) * 128;
-        size_t rounded_to_128b = CEIL_DIV(128+absmax_size+m*k, 128) * 128;
+        // round absmax_size to 128-byte boundary
+        size_t rounded_absmax_size = CEIL_DIV(absmax_size, 128) * 128;
+        size_t rounded_mk = CEIL_DIV(m*k, 128) * 128;
+        size_t rounded_nk = CEIL_DIV(n*k, 128) * 128;
+
+        size_t rounded_to_128_a = 128 + rounded_absmax_size;
+        size_t rounded_to_128_b = rounded_to_128_a + rounded_mk;
+        size_t rounded_to_128_a_trans = rounded_to_128_b + rounded_nk;
+        size_t rounded_to_128_b_trans = rounded_to_128_a_trans + rounded_mk;
 
         unsigned char* absmax_vector = &((unsigned char*)huge_scratch)[128];
         float* absmax_a = &((float*)huge_scratch)[0];
         float* absmax_b = &((float*)huge_scratch)[1];
-        __nv_fp8_e4m3* a_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[rounded_to_128a];
-        __nv_fp8_e4m3* b_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[rounded_to_128b];
+        __nv_fp8_e4m3* a_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[rounded_to_128_a];
+        __nv_fp8_e4m3* a_trans_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[rounded_to_128_a_trans];
 
         cudaMemcpyAsync(absmax_a, initial_absmax, 2 * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+        if (backward) {
+            b_precision = CUDA_R_8F_E5M2;
+            __nv_fp8_e5m2* b_fp8 = &((__nv_fp8_e5m2*)huge_scratch)[rounded_to_128_b];
+            __nv_fp8_e5m2* b_trans_fp8 = &((__nv_fp8_e5m2*)huge_scratch)[rounded_to_128_b_trans];
+
+            get_absmax(b, absmax_b, true, k*n, 1.0f/1024.0f, stream);
+            scale_tensor<__nv_fp8_e5m2>(b_fp8, b, absmax_b, true, k*n, stream);
+
+            b = (floatX*)b_fp8;
+            if (transB) {
+                transpose1(b_trans_fp8, b_fp8, n, k, 4, b_trans_fp8);
+                b = (floatX*)b_trans_fp8;
+            }
+        } else {
+            b_precision = CUDA_R_8F_E4M3;
+            __nv_fp8_e4m3* b_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[rounded_to_128_b];
+            __nv_fp8_e4m3* b_trans_fp8 = &((__nv_fp8_e4m3*)huge_scratch)[rounded_to_128_b_trans];
+
+            get_absmax(b, absmax_b, true, k*n, 1.0/128.0f, stream);
+            scale_tensor<__nv_fp8_e4m3>(b_fp8, b, absmax_b, true, k*n, stream);
+
+            //get_absmax_and_scale(b_fp8, b, absmax_b, absmax_vector, false, n*k, 1.0f/128.0f, stream);
+
+            b = (floatX*)b_fp8;
+            if (transB) {
+                transpose1(b_trans_fp8, b_fp8, n, k, 4, b_trans_fp8);
+                b = (floatX*)b_trans_fp8;
+            }
+        }
+
+        get_absmax(a, absmax_a, true, k*m, 1.0/128.0f, stream);
+        scale_tensor<__nv_fp8_e4m3>(a_fp8, a, absmax_a, true, k*m, stream);
         //get_absmax_and_scale(a_fp8, a, absmax_a, absmax_vector, false, m*k, 1.0f/128.0f, stream);
-        //get_absmax_and_scale(b_fp8, b, absmax_b, absmax_vector, false, n*k, 1.0f/128.0f, stream);
 
         a = (floatX*)a_fp8;
-        b = (floatX*)b_fp8;
+        if (!transA) {
+            transpose1(a_trans_fp8, a_fp8, m, k, 4, a_trans_fp8);
+            a = (floatX*)a_trans_fp8;
+        }
+
+        transA = true;
+        transB = false;
+
+        //get_absmax(a, absmax_a, true, k*m, 1.0/128.0f, stream);
+        //scale_tensor<__nv_fp8_e4m3>(a_fp8, a, absmax_a, true, k*m, stream);
+        //get_absmax(b, absmax_b, true, k*n, 1.0/128.0f, stream);
+        //scale_tensor<__nv_fp8_e4m3>(b_fp8, b, absmax_b, true, k*n, stream);
 
         // Set CUBLASLT_MATMUL_DESC_A_SCALE_POINTER
         cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &absmax_a, sizeof(absmax_a)));
@@ -409,20 +673,25 @@ void matmul_cublaslt(floatX* d, floatX* a, floatX* b, const floatX* bias,
     }
     #endif
 
+    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
+    cublasOperation_t opTranspose = CUBLAS_OP_T;
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, (transA)  ? &opTranspose : &opNoTranspose,   sizeof(opTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, (transB) ? &opTranspose   : &opNoTranspose, sizeof(opNoTranspose)));
+
     // define matrix layouts
     cublasLtMatrixLayout_t ALayout;
     cublasLtMatrixLayout_t BLayout;
     cublasLtMatrixLayout_t DLayout;
     cublasLtMatrixLayout_t CLayout;
     if (transA) {
-        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, input_precision, k, m, k));
+        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, a_precision, k, m, k));
     } else {
-        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, input_precision, m, k, m));
+        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, a_precision, m, k, m));
     }
     if (transB) {
-        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, input_precision, n, k, n));
+        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, b_precision, n, k, n));
     } else {
-        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, input_precision, k, n, k));
+        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, b_precision, k, n, k));
     }
     // cuBLASLt requires C in FP8 mode to be BF16 or FP32... (sigh)
     cublasCheck(cublasLtMatrixLayoutCreate(&CLayout, (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP, m, n, m));
