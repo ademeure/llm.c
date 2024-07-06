@@ -229,5 +229,26 @@ __device__ __forceinline__ void stochastic_rounding(float in, half *out, unsigne
 __device__ __forceinline__ void stochastic_rounding(float in, float *out, unsigned int random) {
     *out = in; // dummy function for when floatX is float (FP32 mode)
 }
+// WIP INEFFICIENT FP8
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e5m2 *out, unsigned int seed) {
+    // todo - is this stochastic rounding *too good*? can we cut any corners?
+    // makes sure each thread gets a different random number
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x001FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x001FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x001FFFFF) : (float_bits  & ~0x001FFFFF);
+    *out = __nv_fp8_e5m2(__uint_as_float(float_bits));
+}
+__device__ __forceinline__ void stochastic_rounding(float in, __nv_fp8_e4m3 *out, unsigned int seed) {
+    // todo - is this stochastic rounding *too good*? can we cut any corners?
+    // makes sure each thread gets a different random number
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
+    unsigned int threshold = random & 0x000FFFFF;
+    unsigned int float_bits = __float_as_uint(in);
+    unsigned int rounded_bits = float_bits & 0x000FFFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0x000FFFFF) : (float_bits  & ~0x000FFFFF);
+    *out = __nv_fp8_e4m3(__uint_as_float(float_bits));
+}
 
 #endif
