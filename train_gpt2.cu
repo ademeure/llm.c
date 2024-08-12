@@ -84,6 +84,51 @@ constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
 
+enum class TType : uint8_t {
+    PARAMETER, ACTIVATION, PARAMETER_GRADIENT, ACTIVATION_GRADIENT, OPTIMIZER, DEFAULT
+};
+
+typedef struct {
+    char name[16];
+    size_t offset; // into base pointer
+    size_t num_elements; // per shard
+    size_t num_shards;
+    TType tensor_type;
+    DType data_type;
+} TensorSpec;
+
+TensorSpec TensorSpecs[16*1024];
+size_t num_tensor_specs = 0;
+size_t current_offset = 0;
+TType default_ttype = TType::PARAMETER;
+
+void add_tensor_spec(const char* name, size_t num_elements, size_t num_shards, DType data_type, TType tensor_type=TType::DEFAULT, int copy_offset_from=-1) {
+    assert(num_tensor_specs < 16*1024);
+    TensorSpec* spec = &TensorSpecs[num_tensor_specs++];
+
+    strncpy(spec->name, name, 16);
+    spec->num_elements = num_elements;
+    spec->num_shards = num_shards;
+    spec->data_type = data_type;
+    spec->tensor_type = (tensor_type == TType::DEFAULT) ? default_ttype : tensor_type;
+
+    if (copy_offset_from >= 0) {
+        spec->offset = TensorSpecs[copy_offset_from].offset;
+    } else {
+        spec->offset = current_offset;
+        current_offset += num_elements * num_shards * sizeof_dtype(data_type);
+    }
+}
+
+void add_layer_specs(int num_layers, const char* name, size_t num_elements, size_t num_shards, TType tensor_type, DType data_type, int copy_offset_from=-1) {
+    for (int l = 0; l < num_layers; l++) {
+        char layer_name[16];
+        snprintf(layer_name, 16, "%s_%d", name, l);
+        add_tensor_spec(layer_name, num_elements, num_shards, tensor_type, data_type, copy_offset_from);
+        if (copy_offset_from >= 0) { copy_offset_from++; }
+    }
+}
+
 typedef struct {
     int max_seq_len; // max sequence length, e.g. 1024
     int vocab_size; // vocab size, e.g. 50257
@@ -96,22 +141,22 @@ typedef struct {
 // the parameters of the model
 constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
-    floatX* wte; // (V, C)
-    floatX* wpe; // (maxT, C)
-    floatX* ln1w; // (L, C)
-    floatX* ln1b; // (L, C)
-    floatX* qkvw; // (L, 3*C, C)
-    floatX* qkvb; // (L, 3*C)
-    floatX* attprojw; // (L, C, C)
-    floatX* attprojb; // (L, C)
-    floatX* ln2w; // (L, C)
-    floatX* ln2b; // (L, C)
-    floatX* fcw; // (L, 4*C, C)
-    floatX* fcb; // (L, 4*C)
-    floatX* fcprojw; // (L, C, 4*C)
-    floatX* fcprojb; // (L, C)
-    floatX* lnfw; // (C)
-    floatX* lnfb; // (C)
+    int wte; // (V, C)
+    int wpe; // (maxT, C)
+    int ln1w; // (L, C)
+    int ln1b; // (L, C)
+    int qkvw; // (L, 3*C, C)
+    int qkvb; // (L, 3*C)
+    int attprojw; // (L, C, C)
+    int attprojb; // (L, C)
+    int ln2w; // (L, C)
+    int ln2b; // (L, C)
+    int fcw; // (L, 4*C, C)
+    int fcb; // (L, 4*C)
+    int fcprojw; // (L, C, 4*C)
+    int fcprojb; // (L, C)
+    int lnfw; // (C)
+    int lnfb; // (C)
 } ParameterTensors;
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
@@ -120,6 +165,26 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     size_t C = config.channels;
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
+
+    DType dtype = DType::FP32;
+    default_ttype = TType::PARAMETER;
+    add_layer_specs("wte",      1, Vp * C, dtype);
+    add_layer_specs("wpe",      1, maxT * C, dtype);
+    add_layer_specs("ln1w",     L, C, dtype);
+    add_layer_specs("ln1b",     L, C, dtype);
+    add_layer_specs("qkvw",     L, 3 * C * C, dtype);
+    add_layer_specs("qkvb",     L, 3 * C, dtype);
+    add_layer_specs("attprojw", L, C * C, dtype);
+    add_layer_specs("attprojb", L, C, dtype);
+    add_layer_specs("ln2w",     L, C, dtype);
+    add_layer_specs("ln2b",     L, C, dtype);
+    add_layer_specs("fcw",      L, 4 * C * C, dtype);
+    add_layer_specs("fcb",      L, 4 * C, dtype);
+    add_layer_specs("fcprojw",  L, C * 4 * C, dtype);
+    add_layer_specs("fcprojb",  L, C, dtype);
+    add_layer_specs("lnfw",     1, C, dtype);
+    add_layer_specs("lnfb",     1, C, dtype);
+
     param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
