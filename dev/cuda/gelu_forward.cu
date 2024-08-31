@@ -30,11 +30,42 @@ size_t B = 1024;
 #define ENABLE_FP32
 #include "common.h"
 
+
+
+
+#include <cuda/barrier>
+using barrier = cuda::barrier<cuda::thread_scope_block>;
+namespace cde = cuda::device::experimental;
+
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+#include <memory>
+#include <chrono>
+#include <thrust/execution_policy.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/fill.h>
+#include <thrust/transform.h>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <cub/device/device_for.cuh>
+#include <cub/iterator/cache_modified_input_iterator.cuh>
+#include <cub/iterator/cache_modified_output_iterator.cuh>
+#include <cuda/std/mdspan>
+#include <cuda/atomic>
+#include <thrust/detail/alignment.h>
+
+
+
+
+
 constexpr bool enable_compression = false;
 constexpr int num_reads = 16;
 constexpr int read_offset = 128;
-constexpr int per_clean_iter = 8; // kernel5
+constexpr int per_clean_iter = 4; // kernel5
 constexpr int parallel_blocks = 3; // kernel5
+constexpr int parallel_blocks_kernel7 = 3;
 
 int num_sms, num_threads_per_sm;
 unsigned int latency_threshold_far;
@@ -243,6 +274,8 @@ void allocateCompressible(void **addr, size_t size, bool use_compression)
 
     // Remap alternating "far" and "near" allocations
     // i.e. if latencies[i] > average_median_latency, then an allocation is far, else near
+    // todo - we really want a way to guarantee it will ALWAYS alternate if there is enough physical memory
+    // => we'd need to allocate extra physical pages to make sure we have enough of each kind to work with
     int current_near = 0;
     int current_far = 0;
     int i = 0;
@@ -364,7 +397,7 @@ void gelu_forward_kernel5(floatX* out, const floatX* inp,
     int blocks_per_side = min_per_side * blocks_per_sm;
     int stride = elements_per_4KiB * blocks_per_side;
 
-    __syncthreads();
+    asm volatile("bar.sync 1,256;" ::: "memory");
     unsigned int block_in_sm = shared_block_in_sm;
     int effective_block_id = (sm_side_id * blocks_per_sm) + block_in_sm;
     //assert(block_in_sm < blocks_per_sm);
@@ -382,6 +415,16 @@ void gelu_forward_kernel5(floatX* out, const floatX* inp,
     idx += (chunk_id >= 512) ? elements_per_2MiB : 0;
     chunk_id &= 511;
 
+    for (int x = 0; x < clean_iter_per_block; x += per_clean_iter) {
+        x128 packed_inps[per_clean_iter];
+        unsigned int out_offset[per_clean_iter];
+
+        inp += idx;
+        out += idx;
+        idx = 0;
+
+    // Older simpler version that was better (or worse) in some cases
+    /*
     for (int x = 0; x < clean_iter_per_block; x += per_clean_iter) {
         x128 packed_inps[per_clean_iter];
         unsigned int out_offset[per_clean_iter];
@@ -413,6 +456,51 @@ void gelu_forward_kernel5(floatX* out, const floatX* inp,
             store128(out + out_offset[y], packed_out);
         }
     }
+    */
+
+        for (int y = 0; y < per_clean_iter/2; y++) {
+            unsigned int idx_plus_2MiB = idx + elements_per_2MiB;
+            unsigned int idx2 = (c_is_far[chunk_id] == sm_side_is_near) ? idx_plus_2MiB : idx;
+            packed_inps[y] = load128cs(inp + idx2);
+            out_offset[y] = idx2;
+
+            chunk_id = (chunk_id + blocks_per_side);
+            idx += stride + ((chunk_id >= 512) ? elements_per_2MiB : 0);
+            chunk_id &= 511;
+        }
+
+        #pragma unroll
+        for (int y = 0; y < per_clean_iter/2; y++) {
+            x128 packed_out;
+            x128 packed_inp = packed_inps[y];
+            for(int k = 0; k < packed_inp.size; ++k) {
+                packed_out[k] = (floatX)gelu_forward_element((float)packed_inp[k]);
+            }
+            store128(out + out_offset[y], packed_out);
+        }
+
+        for (int y = per_clean_iter/2; y < per_clean_iter; y++) {
+            unsigned int idx_plus_2MiB = idx + elements_per_2MiB;
+            unsigned int idx2 = (c_is_far[chunk_id] == sm_side_is_near) ? idx_plus_2MiB : idx;
+            packed_inps[y] = load128cs(inp + idx2);
+            out_offset[y] = idx2;
+
+            chunk_id = (chunk_id + blocks_per_side);
+            idx += stride + ((chunk_id >= 512) ? elements_per_2MiB : 0);
+            chunk_id &= 511;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int y = per_clean_iter/2; y < per_clean_iter; y++) {
+            x128 packed_out;
+            x128 packed_inp = packed_inps[y];
+            for(int k = 0; k < packed_inp.size; ++k) {
+                packed_out[k] = (floatX)gelu_forward_element((float)packed_inp[k]);
+            }
+            store128(out + out_offset[y], packed_out);
+        }
+    }
 
     size_t real_idx = (size_t)(out - original_out);
 
@@ -431,6 +519,349 @@ void gelu_forward_kernel5(floatX* out, const floatX* inp,
         chunk_id += blocks_per_side;
         idx += stride + (chunk_id >= 512 ? elements_per_2MiB : 0);
         chunk_id &= 511;
+    }
+}
+
+
+static constexpr size_t buf_len = 2*1024;
+constexpr int BLOCK_SIZE = 256;
+
+#define USE_TMA_STORES
+
+__global__ void __launch_bounds__(256, 8) gelu_forward_kernel6(floatX* out, const floatX* inp, size_t N, size_t dummy) {
+    extern __shared__ char dynamic_smem[];
+    floatX* smem_data0 = reinterpret_cast<floatX*>(dynamic_smem);
+    floatX* smem_data1 = reinterpret_cast<floatX*>(dynamic_smem + buf_len * sizeof(floatX));
+    barrier* bar = reinterpret_cast<barrier*>(dynamic_smem + 2 * buf_len * sizeof(floatX));
+
+    size_t idx = blockIdx.x;
+    size_t end_idx = N / buf_len;
+    size_t next_idx = idx + gridDim.x;
+
+    size_t offset = idx * buf_len;
+    size_t next_offset = offset + gridDim.x * buf_len;
+
+    // 1. a) Initialize shared memory barrier with the number of threads participating in the barrier.
+    //    b) Make initialized barrier visible in async proxy.
+    #pragma nv_diag_suppress static_var_with_dynamic_init
+    //__shared__ barrier bar[2];
+    barrier::arrival_token token[2];
+    if (threadIdx.x == 0) {
+        init(&bar[0], blockDim.x);                // a)
+        init(&bar[1], blockDim.x);               // a)
+        cde::fence_proxy_async_shared_cta();   // b)
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        cde::cp_async_bulk_global_to_shared(smem_data0, inp + offset, buf_len * sizeof(floatX), bar[0]);
+        // 3a. Arrive on the barrier and tell how many bytes are expected to come in (the transaction count)
+        token[0] = cuda::device::barrier_arrive_tx(bar[0], 1, buf_len * sizeof(floatX));
+    } else { token[0] = bar[0].arrive(); }
+
+    while (idx < end_idx) {
+        if (next_idx < end_idx) {
+            if (threadIdx.x == 0) {
+                cde::cp_async_bulk_global_to_shared(smem_data1, inp + next_offset, buf_len * sizeof(floatX), bar[1]);
+                // 3a. Arrive on the barrier and tell how many bytes are expected to come in (the transaction count)
+                token[1] = cuda::device::barrier_arrive_tx(bar[1], 1, buf_len * sizeof(floatX));
+            } else { token[1] = bar[1].arrive(); }
+        }
+
+        bar[0].wait(std::move(token[0]));
+
+        // Compute
+        #pragma unroll
+        for (int I = threadIdx.x * x128::size; I < buf_len; I += BLOCK_SIZE * x128::size) {
+            x128 packed_inp = load128(smem_data0 + I);
+            x128 packed_out;
+            #pragma unroll
+            for(int k = 0; k < packed_inp.size; ++k) {
+                packed_out[k] = (floatX)gelu_forward_element((float)packed_inp[k]);
+            }
+            #ifdef USE_TMA_STORES
+            store128(smem_data0 + I, packed_out);
+            #else
+            store128(out + offset + I, packed_out);
+            #endif
+        }
+
+        #ifdef USE_TMA_STORES
+        // 5. Wait for shared memory writes to be visible to TMA engine.
+        cde::fence_proxy_async_shared_cta();
+        __syncthreads();
+        // After syncthreads, writes by all threads are visible to TMA engine.
+
+        // 6. Initiate TMA transfer to copy shared memory to global memory
+        if (threadIdx.x == 0) {
+            cde::cp_async_bulk_shared_to_global(out + offset, smem_data0, buf_len * sizeof(floatX));
+            // 7. Wait for TMA transfer to have finished reading shared memory.
+            // Create a "bulk async-group" out of the previous bulk copy operation.
+            cde::cp_async_bulk_commit_group();
+            // Wait for the group to have completed reading from shared memory.
+            cde::cp_async_bulk_wait_group_read<0>();
+        }
+        #endif
+        __syncthreads();
+
+        idx = next_idx;
+        next_idx += gridDim.x;
+        offset = next_offset;
+        next_offset += gridDim.x * buf_len;
+
+        if (idx >= end_idx) {
+            break;
+        }
+
+        // Load next data into smem_data0
+        if (next_idx < end_idx) {
+            if (threadIdx.x == 0) {
+                cde::cp_async_bulk_global_to_shared(smem_data0, inp + next_offset, buf_len * sizeof(floatX), bar[0]);
+                // 3a. Arrive on the barrier and tell how many bytes are expected to come in (the transaction count)
+                token[0] = cuda::device::barrier_arrive_tx(bar[0], 1, buf_len * sizeof(floatX));
+            } else { token[0] = bar[0].arrive(); }
+        }
+
+        bar[1].wait(std::move(token[1]));
+
+        // Compute
+        #pragma unroll
+        for (int I = threadIdx.x * x128::size; I < buf_len; I += BLOCK_SIZE * x128::size) {
+            x128 packed_inp = load128(smem_data1 + I);
+            x128 packed_out;
+            #pragma unroll
+            for(int k = 0; k < packed_inp.size; ++k) {
+                packed_out[k] = (floatX)gelu_forward_element((float)packed_inp[k]);
+            }
+            #ifdef USE_TMA_STORES
+            store128(smem_data1 + I, packed_out);
+            #else
+            store128(out + offset + I, packed_out);
+            #endif
+        }
+
+        #ifdef USE_TMA_STORES
+        // 5. Wait for shared memory writes to be visible to TMA engine.
+        cde::fence_proxy_async_shared_cta();
+        __syncthreads();
+        // After syncthreads, writes by all threads are visible to TMA engine.
+
+        // 6. Initiate TMA transfer to copy shared memory to global memory
+        if (threadIdx.x == 0) {
+            cde::cp_async_bulk_shared_to_global(out + offset, smem_data1, buf_len * sizeof(floatX));
+            // 7. Wait for TMA transfer to have finished reading shared memory.
+            // Create a "bulk async-group" out of the previous bulk copy operation.
+            cde::cp_async_bulk_commit_group();
+            // Wait for the group to have completed reading from shared memory.
+            cde::cp_async_bulk_wait_group_read<0>();
+        }
+        #endif
+        __syncthreads();
+
+        idx = next_idx;
+        next_idx += gridDim.x;
+        offset = next_offset;
+        next_offset += gridDim.x * buf_len;
+    }
+}
+
+
+
+
+__global__ void __launch_bounds__(256, parallel_blocks_kernel7) gelu_forward_kernel7(floatX* out, const floatX* inp, size_t N, size_t dummy, int num_near, int num_far, unsigned int* num_blocks_active) {
+    extern __shared__ char dynamic_smem[];
+    floatX* smem_data0 = reinterpret_cast<floatX*>(dynamic_smem);
+    floatX* smem_data1 = reinterpret_cast<floatX*>(dynamic_smem + 4096);
+    barrier* bar = reinterpret_cast<barrier*>(dynamic_smem + 2 * 4096);
+
+    unsigned int blocks_per_sm = parallel_blocks_kernel7;
+    unsigned int smid;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+
+    __shared__ unsigned int shared_block_in_sm;
+    if (threadIdx.x == 0) {
+        shared_block_in_sm  = atomicInc(num_blocks_active + smid, blocks_per_sm-1);
+    }
+
+    unsigned int sm_side_raw = c_sm_side[smid];
+    unsigned int sm_side_is_near = sm_side_raw & 1;
+    unsigned int sm_side_id = sm_side_raw >> 1;
+    unsigned int min_per_side = min(num_near, num_far);
+
+    if (sm_side_id >= min_per_side) {
+        // todo - stragglers do X% + dynamic???
+        __nanosleep(30000);
+        return;
+    }
+
+    __syncthreads();
+    unsigned int block_in_sm = shared_block_in_sm;
+    assert(block_in_sm < blocks_per_sm);
+
+    int effective_block_id = (sm_side_id * blocks_per_sm) + block_in_sm;
+    int blocks_per_side = min_per_side * blocks_per_sm;
+    int effective_num_blocks = blocks_per_side;
+
+    size_t idx = effective_block_id;
+    size_t end_idx = (N / elements_per_4KiB) / 2; // divided by 2 because there are 2 sides [...]
+    size_t next_idx = idx + effective_num_blocks;
+
+    size_t offset = effective_block_id * elements_per_4KiB;
+    int page_id = offset / elements_per_2MiB;
+    offset += page_id * elements_per_2MiB;
+
+    size_t next_offset = offset + effective_num_blocks * elements_per_4KiB;
+    if (next_offset & elements_per_2MiB) {
+        next_offset += elements_per_2MiB;
+    }
+
+    int chunk_id = ((size_t)(inp + offset) >> 12) & 1023;
+    int next_chunk_id = ((size_t)(inp + next_offset) >> 12) & 1023;
+
+    bool is_far = (c_is_far[chunk_id] == sm_side_is_near);
+    bool is_next_far = (c_is_far[next_chunk_id] == sm_side_is_near);
+
+    // 1. a) Initialize shared memory barrier with the number of threads participating in the barrier.
+    //    b) Make initialized barrier visible in async proxy.
+    #pragma nv_diag_suppress static_var_with_dynamic_init
+    //__shared__ barrier bar[2];
+    barrier::arrival_token token[2];
+    if (threadIdx.x == 0) {
+        init(&bar[0], blockDim.x);                // a)
+        init(&bar[1], blockDim.x);               // a)
+        cde::fence_proxy_async_shared_cta();   // b)
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        const floatX* address = inp + offset;
+        address = is_far ? (address + elements_per_2MiB) : address;
+        cde::cp_async_bulk_global_to_shared(smem_data0, address, 4096, bar[0]);
+        // 3a. Arrive on the barrier and tell how many bytes are expected to come in (the transaction count)
+        token[0] = cuda::device::barrier_arrive_tx(bar[0], 1, 4096);
+    } else { token[0] = bar[0].arrive(); }
+
+    while (idx < end_idx) {
+        if (next_idx < end_idx) {
+            if (threadIdx.x == 0) {
+                const floatX* address = inp + next_offset;
+                address = is_next_far ? (address + elements_per_2MiB) : address;
+                cde::cp_async_bulk_global_to_shared(smem_data1, address, 4096, bar[1]);
+                // 3a. Arrive on the barrier and tell how many bytes are expected to come in (the transaction count)
+                token[1] = cuda::device::barrier_arrive_tx(bar[1], 1, 4096);
+            } else { token[1] = bar[1].arrive(); }
+        }
+
+        bar[0].wait(std::move(token[0]));
+
+        // Compute
+        int I = threadIdx.x * x128::size;
+        x128 packed_inp = load128(smem_data0 + I);
+        x128 packed_out;
+        #pragma unroll
+        for(int k = 0; k < packed_inp.size; ++k) {
+            packed_out[k] = (floatX)gelu_forward_element((float)packed_inp[k]);
+        }
+        #ifdef USE_TMA_STORES
+        store128(smem_data0 + I, packed_out);
+        #else
+        floatX* address = out + offset;
+        address = is_far ? (address + elements_per_2MiB) : address;
+        store128(address + I, packed_out);
+        #endif
+
+        #ifdef USE_TMA_STORES
+        // 5. Wait for shared memory writes to be visible to TMA engine.
+        cde::fence_proxy_async_shared_cta();
+        __syncthreads();
+        // After syncthreads, writes by all threads are visible to TMA engine.
+
+        // 6. Initiate TMA transfer to copy shared memory to global memory
+        if (threadIdx.x == 0) {
+            floatX* address = out + offset;
+            address = is_far ? (address + elements_per_2MiB) : address;
+            cde::cp_async_bulk_shared_to_global(address, smem_data0, 4096);
+            // 7. Wait for TMA transfer to have finished reading shared memory.
+            // Create a "bulk async-group" out of the previous bulk copy operation.
+            cde::cp_async_bulk_commit_group();
+            // Wait for the group to have completed reading from shared memory.
+            cde::cp_async_bulk_wait_group_read<0>();
+        }
+        #endif
+        __syncthreads();
+
+        idx = next_idx;
+        next_idx += effective_num_blocks;
+        offset = next_offset;
+        next_offset += effective_num_blocks * elements_per_4KiB;
+        if (next_offset & elements_per_2MiB) {
+            next_offset += elements_per_2MiB;
+        }
+        is_far = is_next_far;
+        next_chunk_id = ((size_t)(inp + next_offset) >> 12) & 1023;
+        is_next_far = (c_is_far[next_chunk_id] == sm_side_is_near);
+
+        if (idx >= end_idx) {
+            break;
+        }
+
+        // Load next data into smem_data0
+        if (next_idx < end_idx) {
+            if (threadIdx.x == 0) {
+                const floatX* address = inp + next_offset;
+                address = is_next_far ? (address + elements_per_2MiB) : address;
+                cde::cp_async_bulk_global_to_shared(smem_data0, address, 4096, bar[0]);
+                // 3a. Arrive on the barrier and tell how many bytes are expected to come in (the transaction count)
+                token[0] = cuda::device::barrier_arrive_tx(bar[0], 1, 4096);
+            } else { token[0] = bar[0].arrive(); }
+        }
+
+        bar[1].wait(std::move(token[1]));
+
+        // Compute
+        packed_inp = load128(smem_data1 + I);
+        #pragma unroll
+        for(int k = 0; k < packed_inp.size; ++k) {
+            packed_out[k] = (floatX)gelu_forward_element((float)packed_inp[k]);
+        }
+        #ifdef USE_TMA_STORES
+        store128(smem_data1 + I, packed_out);
+        #else
+        address = out + offset;
+        address = is_far ? (address + elements_per_2MiB) : address;
+        store128(address + I, packed_out);
+        #endif
+
+        #ifdef USE_TMA_STORES
+        // 5. Wait for shared memory writes to be visible to TMA engine.
+        cde::fence_proxy_async_shared_cta();
+        __syncthreads();
+        // After syncthreads, writes by all threads are visible to TMA engine.
+
+        // 6. Initiate TMA transfer to copy shared memory to global memory
+        if (threadIdx.x == 0) {
+            floatX* address = out + offset;
+            address = is_far ? (address + elements_per_2MiB) : address;
+            cde::cp_async_bulk_shared_to_global(address, smem_data1, 4096);
+            // 7. Wait for TMA transfer to have finished reading shared memory.
+            // Create a "bulk async-group" out of the previous bulk copy operation.
+            cde::cp_async_bulk_commit_group();
+            // Wait for the group to have completed reading from shared memory.
+            cde::cp_async_bulk_wait_group_read<0>();
+        }
+        #endif
+        __syncthreads();
+
+        idx = next_idx;
+        next_idx += effective_num_blocks;
+        offset = next_offset;
+        next_offset += effective_num_blocks * elements_per_4KiB;
+        if (next_offset & elements_per_2MiB) {
+            next_offset += elements_per_2MiB;
+        }
+        is_far = is_next_far;
+        next_chunk_id = ((size_t)(inp + next_offset) >> 12) & 1023;
+        is_next_far = (c_is_far[next_chunk_id] == sm_side_is_near);
     }
 }
 
@@ -473,6 +904,32 @@ void gelu_forward5(floatX* out, const floatX* inp, int N, int block_size) {
     cudaCheck(cudaGetLastError());
 }
 
+void gelu_forward6(floatX* out, const floatX* inp, size_t N, const int block_size) {
+    // Get number of SMs
+    int nSMs;
+    cudaDeviceGetAttribute(&nSMs, cudaDevAttrMultiProcessorCount, 0);
+
+    int shared_mem_size = 2 * buf_len * sizeof(floatX) + 2 * sizeof(barrier);
+    cudaFuncSetAttribute(gelu_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
+
+    const int grid_size = nSMs * 8;
+    gelu_forward_kernel6<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, 0);
+    cudaCheck(cudaGetLastError());
+}
+
+void gelu_forward7(floatX* out, const floatX* inp, size_t N, const int block_size) {
+    // Get number of SMs
+    int nSMs;
+    cudaDeviceGetAttribute(&nSMs, cudaDevAttrMultiProcessorCount, 0);
+
+    int shared_mem_size = 2 * 4096 + 2 * sizeof(barrier);
+    cudaFuncSetAttribute(gelu_forward_kernel6, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);
+
+    const int grid_size = nSMs * parallel_blocks_kernel7;
+    gelu_forward_kernel7<<<grid_size, block_size, shared_mem_size>>>(out, inp, N, 0, num_near, num_far, num_blocks_active);
+    cudaCheck(cudaGetLastError());
+}
+
 
 // kernel version dispatch
 void gelu_forward(int kernel_num,
@@ -486,6 +943,12 @@ void gelu_forward(int kernel_num,
             break;
         case 5:
             gelu_forward5(out, inp, B * T * C, block_size);
+            break;
+        case 6:
+            gelu_forward6(out, inp, B * T * C, block_size);
+            break;
+        case 7:
+            gelu_forward7(out, inp, B * T * C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
