@@ -85,7 +85,10 @@ constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 // GPT-2 model definition
 
 enum class TType : uint8_t {
-    PARAMETER, ACTIVATION, PARAMETER_GRADIENT, ACTIVATION_GRADIENT, OPTIMIZER, DEFAULT
+    PARAMETER, ACTIVATION,
+    PARAMETER_GRADIENT, ACTIVATION_GRADIENT,
+    PARAMETER_MASTER, OPTIMIZER,
+    DEFAULT
 };
 
 typedef struct {
@@ -102,7 +105,7 @@ size_t num_tensor_specs = 0;
 size_t current_offset = 0;
 TType default_ttype = TType::PARAMETER;
 
-void add_tensor_spec(const char* name, size_t num_elements, size_t num_shards, DType data_type, TType tensor_type=TType::DEFAULT, int copy_offset_from=-1) {
+int add_tensor_spec(const char* name, size_t num_elements, size_t num_shards, DType data_type, int copy_offset_from=-1, TType tensor_type=TType::DEFAULT) {
     assert(num_tensor_specs < 16*1024);
     TensorSpec* spec = &TensorSpecs[num_tensor_specs++];
 
@@ -114,19 +117,27 @@ void add_tensor_spec(const char* name, size_t num_elements, size_t num_shards, D
 
     if (copy_offset_from >= 0) {
         spec->offset = TensorSpecs[copy_offset_from].offset;
+        size_t original_tensor_bytes = TensorSpecs[copy_offset_from].num_elements * sizeof_dtype(TensorSpecs[copy_offset_from].data_type);
+        size_t new_tensor_bytes = num_elements * num_shards * sizeof_dtype(data_type);
+        assert(new_tensor_bytes <= original_tensor_bytes);
     } else {
         spec->offset = current_offset;
         current_offset += num_elements * num_shards * sizeof_dtype(data_type);
     }
+    return num_tensor_specs - 1;
 }
 
-void add_layer_specs(int num_layers, const char* name, size_t num_elements, size_t num_shards, TType tensor_type, DType data_type, int copy_offset_from=-1) {
+int add_layer_specs(int num_layers, const char* name, size_t num_elements, size_t num_shards, DType data_type, int copy_offset_from=-1, bool copy_per_layer=false, TType tensor_type=TType::DEFAULT) {
+    int first_tensor_id = num_tensor_specs;
     for (int l = 0; l < num_layers; l++) {
         char layer_name[16];
         snprintf(layer_name, 16, "%s_%d", name, l);
         add_tensor_spec(layer_name, num_elements, num_shards, tensor_type, data_type, copy_offset_from);
-        if (copy_offset_from >= 0) { copy_offset_from++; }
+        if (copy_per_layer) {
+            copy_offset_from++;
+        }
     }
+    return first_tensor_id;
 }
 
 typedef struct {
@@ -141,72 +152,12 @@ typedef struct {
 // the parameters of the model
 constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
-    int wte; // (V, C)
-    int wpe; // (maxT, C)
-    int ln1w; // (L, C)
-    int ln1b; // (L, C)
-    int qkvw; // (L, 3*C, C)
-    int qkvb; // (L, 3*C)
-    int attprojw; // (L, C, C)
-    int attprojb; // (L, C)
-    int ln2w; // (L, C)
-    int ln2b; // (L, C)
-    int fcw; // (L, 4*C, C)
-    int fcb; // (L, 4*C)
-    int fcprojw; // (L, C, 4*C)
-    int fcprojb; // (L, C)
-    int lnfw; // (C)
-    int lnfb; // (C)
+    int wte, wpe, lnfw, lnfb; // these are not per layer
+    int ln1w, ln1b, qkvw, qkvb, attprojw, attprojb, ln2w, ln2b, fcw, fcb, fcprojw, fcprojb, lnfw, lnfb; // per layer
 } ParameterTensors;
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
-void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
-    size_t Vp = config.padded_vocab_size;
-    size_t C = config.channels;
-    size_t maxT = config.max_seq_len;
-    size_t L = config.num_layers;
-
-    DType dtype = DType::FP32;
-    default_ttype = TType::PARAMETER;
-    add_layer_specs("wte",      1, Vp * C, dtype);
-    add_layer_specs("wpe",      1, maxT * C, dtype);
-    add_layer_specs("ln1w",     L, C, dtype);
-    add_layer_specs("ln1b",     L, C, dtype);
-    add_layer_specs("qkvw",     L, 3 * C * C, dtype);
-    add_layer_specs("qkvb",     L, 3 * C, dtype);
-    add_layer_specs("attprojw", L, C * C, dtype);
-    add_layer_specs("attprojb", L, C, dtype);
-    add_layer_specs("ln2w",     L, C, dtype);
-    add_layer_specs("ln2b",     L, C, dtype);
-    add_layer_specs("fcw",      L, 4 * C * C, dtype);
-    add_layer_specs("fcb",      L, 4 * C, dtype);
-    add_layer_specs("fcprojw",  L, C * 4 * C, dtype);
-    add_layer_specs("fcprojb",  L, C, dtype);
-    add_layer_specs("lnfw",     1, C, dtype);
-    add_layer_specs("lnfb",     1, C, dtype);
-
-    param_sizes[0] = Vp * C; // wte
-    param_sizes[1] = maxT * C; // wpe
-    param_sizes[2] = L * C; // ln1w
-    param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
-    param_sizes[6] = L * C * C; // attprojw
-    param_sizes[7] = L * C; // attprojb
-    param_sizes[8] = L * C; // ln2w
-    param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
-    param_sizes[13] = L * C; // fcprojb
-    param_sizes[14] = C; // lnfw
-    param_sizes[15] = C; // lnfb
-
-    // populate the parameter sizes in bytes (all the same for now, keeping for future use)
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        param_sizeof[i] = sizeof(floatX);
-    }
-}
+#define PARAMETER_SPECS(name, dim1, dim2) model->params->name = add_layer_specs(dim1, #name, dim2, 1, dtype)
 
 // allocate memory for the parameters and point the individual tensors to the right places
 void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
@@ -277,9 +228,6 @@ struct TensorSpec {
     size_t size;
     DType type;
 };
-
-
-#define TENSOR_SPEC(pointer, size) TensorSpec{(void**)(&pointer), (size), dtype_of(pointer)};
 
 void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute) {
     size_t Vp = config.padded_vocab_size;
@@ -415,7 +363,33 @@ void gpt2_init_common(GPT2 *model) {
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
 }
 
+#define PARAMETER_SPECS(name, dim1, dim2) model->params->name = add_layer_specs(dim1, #name, dim2, 1, dtype)
+
 void gpt2_allocate_weights(GPT2 *model) {
+    size_t Vp = model->config.padded_vocab_size;
+    size_t C = model->config.channels;
+    size_t maxT = model->config.max_seq_len;
+    size_t L = model->config.num_layers;
+
+    DType dtype = DType::FP32;
+    default_ttype = TType::PARAMETER;
+    PARAMETER_SPECS(wte,        1, Vp * C);
+    PARAMETER_SPECS(wpe,        1, maxT * C);
+    PARAMETER_SPECS(ln1w,       L, C);
+    PARAMETER_SPECS(ln1b,       L, C);
+    PARAMETER_SPECS(qkvw,       L, 3 * C * C);
+    PARAMETER_SPECS(qkvb,       L, 3 * C);
+    PARAMETER_SPECS(attprojw,   L, C * C);
+    PARAMETER_SPECS(attprojb,   L, C);
+    PARAMETER_SPECS(ln2w,       L, C);
+    PARAMETER_SPECS(ln2b,       L, C);
+    PARAMETER_SPECS(fcw,        L, 4 * C * C);
+    PARAMETER_SPECS(fcb,        L, 4 * C);
+    PARAMETER_SPECS(fcprojw,    L, 4 * C * C);
+    PARAMETER_SPECS(fcprojb,    L, C);
+    PARAMETER_SPECS(lnfw,       1, C);
+    PARAMETER_SPECS(lnfb,       1, C);
+
     // fill in all the parameter tensor dimensions and types
     fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
     model->num_parameters = 0;
