@@ -166,6 +166,68 @@ int main(int argc, const char **argv) {
     cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(floatX)));
     cudaCheck(memcpy_convert(d_inp, inp, B * T * C));
 
+    // Define the number of BF16 values
+    const int num_bf16_values = 65536;
+
+    // Allocate host memory for BF16 input values and output values
+    floatX* bf16_inp = (floatX*)malloc(num_bf16_values * sizeof(floatX));
+    floatX* bf16_out1 = (floatX*)malloc(num_bf16_values * sizeof(floatX));
+    floatX* bf16_out3 = (floatX*)malloc(num_bf16_values * sizeof(floatX));
+
+    // Initialize BF16 input values
+    for (unsigned short i = 0; i < num_bf16_values; i++) {
+        // reinterpret cast the bits of i as a bfloat16
+        bf16_inp[i] = (floatX)*((__nv_bfloat16*)&i);
+        if (i == num_bf16_values - 1) {
+            break;
+        }
+    }
+
+    // Allocate device memory for BF16 input values and output values
+    floatX* d_bf16_inp;
+    floatX* d_bf16_out1;
+    floatX* d_bf16_out3;
+    cudaCheck(cudaMalloc(&d_bf16_inp, num_bf16_values * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&d_bf16_out1, num_bf16_values * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&d_bf16_out3, num_bf16_values * sizeof(floatX)));
+
+    // Copy BF16 input values to device
+    cudaCheck(cudaMemcpy(d_bf16_inp, bf16_inp, num_bf16_values * sizeof(floatX), cudaMemcpyHostToDevice));
+
+    // Run the gelu_forward1 kernel
+    gelu_forward(1, d_bf16_out1, d_bf16_inp, 1, 1, num_bf16_values, 256);
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Run the gelu_forward3 kernel
+    gelu_forward(3, d_bf16_out3, d_bf16_inp, 1, 1, num_bf16_values, 256);
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Copy the results back to host
+    cudaCheck(cudaMemcpy(bf16_out1, d_bf16_out1, num_bf16_values * sizeof(floatX), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(bf16_out3, d_bf16_out3, num_bf16_values * sizeof(floatX), cudaMemcpyDeviceToHost));
+
+    // Compare the results and print the differences
+    float max_diff = 0.0f;
+    for (int i = 0; i < num_bf16_values; i++) {
+        float diff = fabsf((float)bf16_out1[i] - (float)bf16_out3[i]);
+        if (diff > 0.0f) {
+            float percentage = diff / (float)fabsf(bf16_out1[i]) * 100.0f;
+            printf("[%d]: INPUT %.15f ===> %.15f vs %.15f ===> DIFF: %.15f (%.8f%%)\n", i, (float)bf16_inp[i], (float)bf16_out1[i], (float)bf16_out3[i], diff, percentage);
+        }
+        if (diff > max_diff) {
+            max_diff = diff;
+        }
+    }
+    printf("Maximum difference between gelu_forward1 and gelu_forward3: %.50f\n", max_diff);
+
+    // Free host and device memory
+    free(bf16_inp);
+    free(bf16_out1);
+    free(bf16_out3);
+    cudaCheck(cudaFree(d_bf16_inp));
+    cudaCheck(cudaFree(d_bf16_out1));
+    cudaCheck(cudaFree(d_bf16_out3));
+
     // time the kernel at different block sizes
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {

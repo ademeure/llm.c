@@ -164,6 +164,95 @@ int main(int argc, char **argv) {
     float* inp = make_random_float(B * T * C);
     float* dout = make_random_float(B * T * C);
 
+    // Define the number of BF16 values
+    const int num_bf16_values = 65536;
+
+    // Allocate host memory for BF16 input values, output values, and gradient output values
+    floatX* bf16_inp = (floatX*)malloc((num_bf16_values/4 * num_bf16_values/4) * sizeof(floatX));
+    floatX* bf16_dout = (floatX*)malloc((num_bf16_values/4 * num_bf16_values/4) * sizeof(floatX));
+    floatX* bf16_dinp1 = (floatX*)malloc((num_bf16_values/4 * num_bf16_values/4) * sizeof(floatX));
+    floatX* bf16_dinp3 = (floatX*)malloc((num_bf16_values/4 * num_bf16_values/4) * sizeof(floatX));
+
+    // Initialize BF16 input values and gradient output values
+    int index = 0;
+    for (unsigned short i = 0; i < num_bf16_values; i += 1) {
+        for (unsigned short j = 0; j < num_bf16_values; j += 99) {
+            // reinterpret cast the bits of i and j as bfloat16
+            bf16_inp[index] = (floatX)*((__nv_bfloat16*)&i);
+            bf16_dout[index] = (floatX)*((__nv_bfloat16*)&j);
+            if ((int)j + 99 >= num_bf16_values) {
+                break;
+            }
+
+            if (fabsf(bf16_inp[index]) >= 1000000.0f || fabsf(bf16_dout[index]) >= 1000000.0f) {
+                continue;
+            }
+            index++;
+        }
+        if ((int)i + 1 >= num_bf16_values) {
+            break;
+        }
+    }
+
+    // Allocate device memory for BF16 input values, output values, and gradient output values
+    floatX* d_bf16_inp;
+    floatX* d_bf16_dout;
+    floatX* d_bf16_dinp1;
+    floatX* d_bf16_dinp3;
+    cudaCheck(cudaMalloc(&d_bf16_inp, index * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&d_bf16_dout, index * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&d_bf16_dinp1, index * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&d_bf16_dinp3, index * sizeof(floatX)));
+
+    // Copy BF16 input values and gradient output values to device
+    cudaCheck(cudaMemcpy(d_bf16_inp, bf16_inp, index * sizeof(floatX), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_bf16_dout, bf16_dout, index * sizeof(floatX), cudaMemcpyHostToDevice));
+
+    // Run the gelu_backward1 kernel
+    gelu_backward(1, d_bf16_dinp1, d_bf16_inp, d_bf16_dout, 1, 1, index, 256);
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Run the gelu_backward3 kernel
+    gelu_backward(3, d_bf16_dinp3, d_bf16_inp, d_bf16_dout, 1, 1, index, 256);
+    cudaCheck(cudaDeviceSynchronize());
+
+    // Copy the results back to host
+    cudaCheck(cudaMemcpy(bf16_dinp1, d_bf16_dinp1, index * sizeof(floatX), cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(bf16_dinp3, d_bf16_dinp3, index * sizeof(floatX), cudaMemcpyDeviceToHost));
+
+    // Compare the results and print the differences
+    float max_diff = 0.0f;
+
+    for (int i = 0; i < index; i++) {
+        float diff = fabsf((float)bf16_dinp1[i] - (float)bf16_dinp3[i]);
+        if (diff >= 0.00000000000000001f) {
+            float percentage = diff / (float)fabsf(bf16_dinp1[i]) * 100.0f;
+            printf("[%d]: INPUT %.15f, DOUT %.15f ===> %.15f vs %.15f ===> DIFF: %.15f (%.8f%%)\n",
+                    i, (float)bf16_inp[i], (float)bf16_dout[i],
+                    (float)bf16_dinp1[i], (float)bf16_dinp3[i], diff, percentage);
+        }
+        if (diff > max_diff) {
+            max_diff = diff;
+        }
+    }
+    printf("Maximum difference between gelu_backward1 and gelu_backward3: %.50f\n", max_diff);
+
+    // Free host and device memory
+    free(bf16_inp);
+    free(bf16_dout);
+    free(bf16_dinp1);
+    free(bf16_dinp3);
+    cudaCheck(cudaFree(d_bf16_inp));
+    cudaCheck(cudaFree(d_bf16_dout));
+    cudaCheck(cudaFree(d_bf16_dinp1));
+    cudaCheck(cudaFree(d_bf16_dinp3));
+
+
+
+
+
+
+
     // read kernel_num from command line
     int kernel_num = 1;
     if (argc > 1) {
