@@ -53,15 +53,15 @@ enum UIDs {
 };
 
 // Need a cache because graph->build_operation_graph() is slow but everything else seems fast
-using cache_type_fwd = std::map<std::tuple<int,int,int,int, int>, std::shared_ptr<fe::graph::Graph>>;
+using cache_type_fwd = std::map<std::tuple<int,int,int,int,int,int>, std::shared_ptr<fe::graph::Graph>>;
 using cache_type_bwd = std::map<std::tuple<int,int,int,int>, std::shared_ptr<fe::graph::Graph>>;
 
 // Loosely based on cuDNN frontend samples functions and massively simplified
-auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_only) {
+auto lookup_cache_or_build_graph_fwd(int B, int NH_KV, int NH_Q, int T, int HS, int is_inference_only) {
 
     static cache_type_fwd user_maintained_cache_fwd;
 
-    auto key = std::make_tuple(B, H, T, HS, is_inference_only);
+    auto key = std::make_tuple(B, NH_KV, NH_Q, T, HS, is_inference_only);
 
     auto it = user_maintained_cache_fwd.find(key);
     if (it != user_maintained_cache_fwd.end()) {
@@ -74,18 +74,19 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
           .set_compute_data_type(fe::DataType_t::FLOAT);
 
     // QKV is (B, T, 3, NH, HS) which cuDNN can handle directly without an external permute
+    long int stride = (NH_KV + NH_KV + NH_Q) * HS;
     auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q")
-                               .set_dim({B, H, T, HS})
+                               .set_dim({B, NH_Q, T, HS})
                                .set_uid(Q_UID)
-                               .set_stride({3 * H * HS * T,  HS, 3 * H * HS, 1}));
+                               .set_stride({stride * T, HS, stride, 1}));
     auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K")
-                               .set_dim({B, H, T, HS})
+                               .set_dim({B, NH_KV, T, HS})
                                .set_uid(K_UID)
-                               .set_stride({3 * H * HS * T, HS, 3 * H * HS, 1}));
+                               .set_stride({stride * T, HS, stride, 1}));
     auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V")
-                               .set_dim({B, H, T, HS})
+                               .set_dim({B, NH_KV, T, HS})
                                .set_uid(V_UID)
-                               .set_stride({3 * H * HS * T, HS, 3 * H * HS, 1}));
+                               .set_stride({stride * T, HS, stride, 1}));
     auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
                                .set_dim({1, 1, 1, 1})
                                .set_stride({1, 1, 1, 1})
@@ -102,13 +103,13 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
     auto [O, stats] = graph->sdpa(Q, K, V, sdpa_options);
 
     // Output is (B, T, NH, HS) BF16/FP16 and stats for backward pass is (B, NH, T) FP32
-    O->set_output(true).set_dim({B, H, T, HS}).set_stride({H * HS * T, HS, H * HS, 1}).set_uid(O_UID);
+    O->set_output(true).set_dim({B, NH_Q, T, HS}).set_stride({NH_Q * HS * T, HS, NH_Q * HS, 1}).set_uid(O_UID);
 
     assert(stats == nullptr || is_inference_only == false);
     if (is_inference_only == false) {
         stats->set_output(true).set_data_type(fe::DataType_t::FLOAT)
-                               .set_dim({B, H, T, 1})
-                               .set_stride({H * T, T, 1, 1})
+                               .set_dim({B, NH_Q, T, 1})
+                               .set_stride({NH_Q * T, T, 1, 1})
                                .set_uid(Stats_UID);
     }
 
@@ -222,20 +223,20 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
 void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
-                             int B, int T, int NH, int C, cudaStream_t stream) {
+                             int B, int T, int NH_KV, int NH_Q, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
-    int HS = C / NH; // number of features per head
+    int HS = C / NH_Q; // number of features per head
     bool is_inference_only = (stats == nullptr);
 
     cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
 
     // Get graph and tensors from cache (or generate it on first use)
-    auto graph = lookup_cache_or_build_graph_fwd(B, NH, T, HS, is_inference_only);
+    auto graph = lookup_cache_or_build_graph_fwd(B, NH_KV, NH_Q, T, HS, is_inference_only);
 
     // Prepare all the tensor pointers for executing the graph
     void* devPtrQ = inp;
     void* devPtrK = (inp + C);
-    void* devPtrV = (inp + 2 * C);
+    void* devPtrV = (inp + C + HS * NH_KV);
     float attn_scale_cpu = 1.0 / sqrtf(HS);
     void* devPtrO = out;
 
