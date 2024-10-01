@@ -342,6 +342,9 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+    int use_rope; // use rope position encoding
+    float rope_base_freq; // base frequency for rope position encoding
+    float* rope_freqs; // rope position encoding frequencies
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -371,6 +374,10 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    // architecture specific settings
+    model->use_rope = 0; // use rope position encoding
+    model->rope_base_freq = 10000.0f; // base frequency for rope position encoding
+    model->rope_freqs = NULL; // rope position encoding frequencies
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -395,6 +402,15 @@ void gpt2_allocate_weights(GPT2 *model) {
     // create memory for model parameters on the device
     assert(model->params_memory == nullptr);
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+
+    // allocate memory for rope frequencies
+    if (model->use_rope) {
+        int HS = model->config.channels / model->config.num_heads;
+        assert(HS % 2 == 0); // HS must be even for RoPE
+        cudaCheck(cudaMalloc((float**)&model->rope_freqs, model->config.max_seq_len * (HS / 2) * sizeof(float)));
+        // TODO(gordicaleksa): would floatX mess up the rope frequencies due to a lower precision?
+        init_rope_freqs(model->rope_freqs, model->config.max_seq_len, HS / 2, model->rope_base_freq, main_stream);
+    }
 }
 
 void gpt2_allocate_state(GPT2 *model, int B, int T) {
@@ -636,7 +652,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     for (int i = 0; i < 32; i++) {
         printf("cpu[%d] = %.8f\n", i, (float) cpu[i]);
     }
-    exit(0);
+    //exit(0);
     // ------------------------------------------------------------------------
 
     for (int l = 0; l < L; l++) {
@@ -672,10 +688,19 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
 
         // now start the block forward pass
-        #ifdef ENABLE_CUDNN
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
+
+        if (model->use_rope) {
+            const int block_size = 256;
+            assert(hd % x128::size == 0);
+            int total_threads = B * NH * T * (hd / x128::size);
+            int num_blocks = CEIL_DIV(total_threads, block_size);
+            //rope_rotate_kernel<<<num_blocks, block_size, 0, main_stream>>>(l_qkvr, model->rope_freqs, B, n_head, n_kn_head, T, hd, 0);
+        }
+
+        #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, n_head, n_kn_head, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         if (T != model->seq_len) { // unused parts of attention buffer must be zeroed (T-dependent)
@@ -684,8 +709,19 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, qkv_channels, main_stream);
+
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
+
+        floatX* cpu = (floatX*)mallocCheck(33000 * sizeof(floatX));
+        cudaCheck(cudaMemcpy(cpu, l_atty, 33000 * sizeof(floatX), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < 9001; i++) {
+            printf("y_pre_proj[%d] = %.8f\n", i, (float) cpu[i]);
+        }
+        for(int i = 32000; i < 33000; i++) {
+            printf("y_pre_proj[%d] = %.8f\n", i, (float) cpu[i]);
+        }
+        exit(0);
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);

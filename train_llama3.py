@@ -171,7 +171,7 @@ class CausalSelfAttention(nn.Module):
         # DEBUGGING: print first 32 elements of x
         for i in range(32):
             print("acts[{}]: {:.8f}".format(i, x.view(-1)[i].item()))
-        breakpoint()
+        #breakpoint()
         # ---------------------------------------------------------------------
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -190,6 +190,17 @@ class CausalSelfAttention(nn.Module):
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
 
+        '''
+        for i in range(0,9001):
+            print("k[{}]: {:.8f}".format(i, k.contiguous().view(-1)[i].item()))
+        for i in range(0,0):
+            print("k[{}]: {:.8f}".format(i, k.contiguous().view(-1)[i].item()))
+        #from -32 to end
+        #for i in range(B * T * C - 32, B * T * C):
+            #print("q[{}]: {:.8f}".format(i, y.view(-1)[i].item()))
+        breakpoint()
+        '''
+
         if self.flash:
             # flashattention
             # if T == 1 no need to mask, otherwise the function complains
@@ -205,6 +216,15 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(scores.float(), dim=-1).type_as(q)
             y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        for i in range(9001):
+            print("y_pre_proj[{}]: {:.8f}".format(i, y.view(-1)[i].item()))
+        #from -32 to end
+        for i in range(32000,33000):
+            print("y_pre_proj[{}]: {:.8f}".format(i, y.view(-1)[i].item()))
+        breakpoint()
+
+
         y = self.c_proj(y)
         return y
 
