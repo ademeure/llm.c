@@ -16,6 +16,64 @@ In the backward pass, the gradients flow to both, handled by different kernels
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
+__global__ void rope_rotate_kernel(floatX* inp, float* rope_freqs, int B, int NH_Q, int NH_KV, int T, int HS, int is_backward) {
+    // thanks to the nice mathematical properties of RoPE this is both our fwd & bwd pass kernel!
+    // the only difference is that we have to toggle the sign of the sin term in the rotation
+    // q, k are of shape (B, NH, T, HS)
+    // rope_freqs is of shape (T, HS/2)
+    int n = HS / x128::size;
+    int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx >= B * NH_Q * T * n) { return; }
+
+    int total_heads_times_QKV = (NH_Q + 2 * NH_KV) * HS;
+
+    // (B, N = t, 3, NH, d = HS)
+    int b = thread_idx / (NH_Q * T * n);
+    int rest = thread_idx % (NH_Q * T * n);
+    int t = rest / (NH_Q * n);
+    rest = rest % (NH_Q * n);
+    int nh = rest / n;
+    int i = rest % n;
+
+    float* rope_freqs_t = rope_freqs + t * (HS / 2) + i * (x128::size / 2);
+    f128 freqs_reg = load128(rope_freqs_t);  // caching the frequencies
+    int idx = (b * T * total_heads_times_QKV) + (t * total_heads_times_QKV) + (i * x128::size);
+
+    // Query-specific part
+    int idx_q = idx + (nh * HS);
+    x128 q_reg = load128(&inp[idx_q]);
+    x128 qout_reg;
+    for (int k = 0; k < x128::size / 2; k++) {  // div by 2 because we're processing tuples of 2
+        // rotate q
+        floatX x1 = q_reg[2*k];
+        floatX x2 = q_reg[2*k + 1];
+        floatX q_out1 = (floatX)((float)x1 * cosf(freqs_reg[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs_reg[k]));
+        floatX q_out2 = (floatX)((float)x2 * cosf(freqs_reg[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs_reg[k]));
+        qout_reg[2*k] = q_out1;
+        qout_reg[2*k + 1] = q_out2;
+    }
+    store128cs(&inp[idx_q], qout_reg);
+
+    // Key-specific part (only 1/4th as many threads needed for Llama3.1 GQA)
+    if (nh > NH_KV) return;
+
+    int nh_k = nh;
+    int idx_k = idx + (NH_Q * HS) + (nh_k * HS);
+    x128 k_reg = load128(&inp[idx_k]);
+    x128 kout_reg;
+    for (int k = 0; k < x128::size / 2; k++) {  // div by 2 because we're processing tuples of 2
+        // rotate k
+        floatX x1 = k_reg[2*k];
+        floatX x2 = k_reg[2*k + 1];
+        floatX k_out1 = (floatX)((float)x1 * cosf(freqs_reg[k]) + (is_backward ? 1 : -1) * (float)x2 * sinf(freqs_reg[k]));
+        floatX k_out2 = (floatX)((float)x2 * cosf(freqs_reg[k]) + (is_backward ? -1 : 1) * (float)x1 * sinf(freqs_reg[k]));
+        kout_reg[2*k] = k_out1;
+        kout_reg[2*k + 1] = k_out2;
+    }
+
+    store128cs(&inp[idx_k], kout_reg);
+}
+
 __global__ void encoder_forward_kernel3(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
@@ -169,8 +227,24 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
     store128(dwpe_tc, packed_dwpe);
 }
 
+__global__ void init_rope_freqs_kernel(float* rope_freqs, float rope_base_freq) {
+    int m = blockIdx.x;
+    int d_half = blockDim.x;
+    int i = threadIdx.x + 1;
+    int out_idx = m * d_half + i - 1;
+
+    float theta_i = __powf(rope_base_freq, -2.0f * (float)(i - 1) / (2.f * (float)d_half));
+    rope_freqs[out_idx] = (float)m * theta_i;
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
+
+void init_rope_freqs(float* rope_freqs, int max_seq_len, int HS, float rope_base_freq, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    init_rope_freqs_kernel<<<max_seq_len, HS, 0, stream>>>(rope_freqs, rope_base_freq);
+    cudaCheck(cudaGetLastError());
+}
 
 void encoder_forward(floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
@@ -197,11 +271,13 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
     NVTX_RANGE_FN();
 
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
-    const int block_size = 256;
-    const int N = T * C / x128::size;
-    const int grid_size = CEIL_DIV(N, block_size);
-    wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
-    cudaCheck(cudaGetLastError());
+    if (dwpe == NULL) {
+        const int block_size = 256;
+        const int N = T * C / x128::size;
+        const int grid_size = CEIL_DIV(N, block_size);
+        wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
+        cudaCheck(cudaGetLastError());
+    }
 
     // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
     // todo - this is trivially true given hardcoded scratch buffer size here, is this useful?

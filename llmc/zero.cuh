@@ -529,6 +529,7 @@ void multi_gpu_async_reduce_gradient(
     cudaCheck(cudaStreamWaitEvent(config->nccl_stream, config->compute_nccl_sync));
     ncclCheck(ncclGroupStart()); // NCCL group: aggregate all pointers in a single NCCL GPU kernel.
     for (int i = 0; i < N; ++i) {
+        if (pointers[i] == NULL) continue;
         if(config->zero_stage == 0) {
             ncclCheck(ncclAllReduce(
                     pointers[i], pointers[i],
@@ -594,4 +595,3 @@ float multi_gpu_cpu_float_sum(float value, MultiGpuConfig* config) {
 }
 
 #endif
-
