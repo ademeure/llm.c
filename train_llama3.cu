@@ -266,12 +266,12 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     size_t ffn_channels_post_gelu = hidden_dim; // swiglu will halve the channels
 
     // activation checkpointing: only need memory for Lc layers (except for residual3)
-    int Lc = layers_per_checkpoint ? layers_per_checkpoint : L;
+    int Lc = recompute_residual3 ? 1 : (layers_per_checkpoint ? layers_per_checkpoint : L);
     if (L % Lc != 0) {
         printf("Error: number of layers (%d) must be divisible by layers_per_checkpoint (-ac %d)\n", (int)L, Lc);
         exit(1);
     }
-    int num_residual3_layers = recompute_residual3 ? (L/Lc) + (Lc - 1) : L;
+    int num_residual3_layers = recompute_residual3 ? layers_per_checkpoint : L;
 
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
@@ -350,6 +350,8 @@ typedef struct {
     ActivationTensors acts;
     TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
     void* acts_memory;
+    // residual3 when they are offloaded to CPU with recompute_residual3 = true
+    floatX* residual3_offloaded;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
     int seq_len; // the sequence length (T) of current forward pass
@@ -380,6 +382,7 @@ void gpt2_init_common(GPT2 *model) {
     model->targets = NULL;
     model->accumulated_mean_loss = NULL;
     model->cpu_losses = NULL;
+    model->residual3_offloaded = NULL;
     // the B,T params are determined and set, fixed on first batch in forward()
     model->batch_size = 0;
     model->seq_len = 0;
@@ -435,6 +438,14 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     // allocate the space
     fill_in_activation_sizes(&model->acts, model->acts_specs, B, T, model->config, model->recompute, model->layers_per_checkpoint, model->recompute_residual3);
     model->acts_memory = malloc_and_point_activations(model->acts_specs);
+    // allocate residual3_offloaded on CPU if recompute_residual3 is true
+    if (model->recompute_residual3) {
+        size_t num_residual3_checkpoints = model->config.num_layers / model->layers_per_checkpoint;
+        size_t bytes = num_residual3_checkpoints * B * T * model->config.channels * sizeof(floatX);
+        printf0("allocating %d MiB on CPU for residual3_offloaded\n", (int)round(bytes / (1024 * 1024)));
+        cudaCheck(cudaMallocHost((void**)&model->residual3_offloaded, bytes));
+    }
+
     // also create memory for caching inputs and targets
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
     cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -618,7 +629,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     cudaCheck(cudaDeviceSynchronize());
 }
 
-void transformer_layer_forward(GPT2* model, size_t B, size_t T, int l, bool recompute_from_checkpoint=false) {
+void transformer_layer_forward(GPT2* model, size_t B, size_t T, int l, bool recompute_from_residual=false, bool compute_residual=true, bool read_offloaded=false, bool write_offloaded=false) {
     // convenience parameters
     const size_t L = model->config.num_layers;
     const size_t NH = model->config.num_heads;
@@ -644,28 +655,19 @@ void transformer_layer_forward(GPT2* model, size_t B, size_t T, int l, bool reco
     // --------------------------------
     NvtxRange layer_range("LayerForward", l);
 
-    int l_act = L_per_checkpoint ? l % L_per_checkpoint : l;
-    int l_residual3_current = model->recompute_residual3 ? (Lc + l_act) : l;
-    int l_residual3_prev = (l-1);
-
-    bool recompute_ln1 = recompute_from_checkpoint;
-    bool compute_next_residual3 = !recompute_from_checkpoint;
-    if (model->recompute_residual3) {
-        if (l_act == 0) {
-            l_residual3_prev = (l-1) / L_per_checkpoint;
-            compute_next_residual3 = true;
-        } else {
-            recompute_ln1 = false;
-            l_residual3_prev = Lc + l_act - 1;
-            if (l_act == L_per_checkpoint - 1) {
-                l_residual3_current = l / L_per_checkpoint;
-            } else {
-                compute_next_residual3 = true;
-            }
-        }
-    }
+    int l_act = model->recompute_residual3 ? 0 : (L_per_checkpoint ? l % L_per_checkpoint : l);
+    int l_residual3_current = model->recompute_residual3 ? (l % L_per_checkpoint) : l;
+    int l_residual3_prev = model->recompute_residual3 ? ((l-1) % L_per_checkpoint) : (l-1);
 
     floatX* residual = l == 0 ? acts.encoded : acts.residual3 + l_residual3_prev * B * T * C;
+    floatX* l_residual3 = acts.residual3 + l_residual3_current * B * T * C; // these are effectively the main checkpoints
+
+    if (model->recompute_residual3 && read_offloaded && l % L_per_checkpoint == 0 && l > 0) {
+        // todo: do this in parallel on another stream
+        size_t read_layer = (l-1) / L_per_checkpoint;
+        size_t elements = B * T * C;
+        cudaCheck(cudaMemcpyAsync(residual, model->residual3_offloaded + elements * read_layer, elements * sizeof(floatX), cudaMemcpyHostToDevice, main_stream));
+    }
 
     // get the pointers of the weights for this layer
     floatX* l_ln1w = params.ln1w + l * C;
@@ -691,11 +693,10 @@ void transformer_layer_forward(GPT2* model, size_t B, size_t T, int l, bool reco
     // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
     // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
     floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l_act * B * T * ffn_channels_post_gelu : acts.fch_gelu;
-    floatX* l_residual3 = acts.residual3 + l_residual3_current * B * T * C; // these are effectively the main checkpoints
     floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
     floatX* qkv_rep_scratch = (floatX*)acts.scratch_bt4c; // we can use the BT4C scratch for qkv replication
 
-    if (recompute_ln1) {
+    if (recompute_from_residual) {
         rmsnorm_forward(l_ln1, l_ln1_rstd, residual, l_ln1w, B, T, C, main_stream);
     }
 
@@ -725,18 +726,25 @@ void transformer_layer_forward(GPT2* model, size_t B, size_t T, int l, bool reco
     matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, ffn_channels, main_stream);
     swiglu_forward(l_fch_gelu, l_fch, B, T, ffn_channels_post_gelu, main_stream);
 
-    if (compute_next_residual3) {
+    if (compute_residual) {
         // by saving the residual of every single layer, we avoid one of the 2 big matmuls
         // we could save even a bit more memory by e.g. only saving 1 in 2 residuals when layers_per_checkpoint=2
         // but that would result in needing to recompute this matmul *and* more complex code for the pointer calculations
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, ffn_channels_post_gelu, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
-            int next_l = L_per_checkpoint ? (l+1) % L_per_checkpoint : (l+1);
+            int next_l = model->recompute_residual3 ? 0 : (L_per_checkpoint ? (l+1) % L_per_checkpoint : (l+1));
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + next_l * B * T * C : acts.lnf;
             float* l_ln1_rstd = acts.ln1_rstd + next_l * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             fused_residual_rmsnorm_forward5(l_residual3, l_ln1, l_ln1_rstd, l_residual2, scratch, l_ln1w, B * T, C, main_stream);
+
+            if (model->recompute_residual3 && write_offloaded && (l % L_per_checkpoint) == (L_per_checkpoint - 1) && l != L-1) {
+                // todo: do this in parallel on another stream
+                size_t write_layer = l / L_per_checkpoint;
+                size_t elements = B * T * C;
+                cudaCheck(cudaMemcpyAsync(model->residual3_offloaded + elements * write_layer, l_residual3, elements * sizeof(floatX), cudaMemcpyDeviceToHost, main_stream));
+            }
         } else {
             fused_residual_rmsnorm_forward5(l_residual3, acts.lnf, acts.lnf_rstd, l_residual2, scratch, params.lnfw, B * T, C, main_stream);
         }
@@ -782,7 +790,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     rmsnorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_rstd, acts.encoded, params.ln1w, B, T, C, main_stream); // cannot be fused
 
     for (int l = 0; l < L; l++) {
-        transformer_layer_forward(model, B, T, l, false);
+        transformer_layer_forward(model, B, T, l, false, true, false, true);
     }
 
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wpe, NULL, B, T, C, Vp, main_stream);
@@ -859,7 +867,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
     int L_per_checkpoint = model->layers_per_checkpoint;
-    int Lc = model->recompute_residual3 ? (L / L_per_checkpoint) : L;
+    int Lc = model->recompute_residual3 ? L_per_checkpoint : L;
 
     // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
     NvtxRange classifier_and_loss_range("classifier_and_loss");
@@ -895,15 +903,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     for (int l = L-1; l >= 0; l--) {
         NvtxRange layer_range("LayerBackward", l);
 
-        int l_act = L_per_checkpoint ? l % L_per_checkpoint : l;
-        int l_residual3_prev = (l-1);
-        if (model->recompute_residual3) {
-            if (l_act == 0) {
-                l_residual3_prev = (l-1) / L_per_checkpoint;
-            } else {
-                l_residual3_prev = Lc + l_act - 1;
-            }
-        }
+        int l_act = model->recompute_residual3 ? 0 : (L_per_checkpoint ? l % L_per_checkpoint : l);
+        int l_residual3_prev = model->recompute_residual3 ? ((l-1) % L_per_checkpoint) : (l-1);
         residual = l == 0 ? acts.encoded : acts.residual3 + l_residual3_prev * B * T * C;
 
         // get the pointers of the weights for this layer
@@ -1010,11 +1011,13 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         }
 
         // Is it time to redo the forward pass starting from one of our activation checkpoints?
-        if (model->layers_per_checkpoint) {
-            if(l > 0 && l % max(1, model->layers_per_checkpoint) == 0) {
+        if (model->layers_per_checkpoint && l > 0) {
+            if(l % model->layers_per_checkpoint == 0) {
                 for (int i = 0; i < model->layers_per_checkpoint; i++) {
-                    transformer_layer_forward(model, B, T, (l - model->layers_per_checkpoint) + i, true);
+                    transformer_layer_forward(model, B, T, (l - model->layers_per_checkpoint) + i, true, model->recompute_residual3, model->recompute_residual3, false);
                 }
+            } else if (model->recompute_residual3) {
+                transformer_layer_forward(model, B, T, (l - 1), true, false, false, false);
             }
         }
     }
@@ -1236,6 +1239,7 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->targets);
     cudaFreeCheck(&model->accumulated_mean_loss);
     cudaCheck(cudaFreeHost(model->cpu_losses));
+    cudaCheck(cudaFreeHost(model->residual3_offloaded));
     free(model->workload_indices);
     free(model->bucket_info);
 }
