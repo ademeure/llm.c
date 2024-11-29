@@ -14,7 +14,7 @@
 // ----------------------------------------------------------------------------
 
 enum TT : uint8_t {
-    PARAMETER=0, PARAMETER_GRAD, PARAMETER_OPT_M, PARAMETER_OPT_V, PARAMETER_MASTER, // 1 allocation each
+    PARAMETER=0, PARAMETER_GRAD, PARAMETER_GRAD_ABS, PARAMETER_GRAD_SQUARED,PARAMETER_OPT_M, PARAMETER_OPT_V, PARAMETER_MASTER, // 1 allocation each
     MULTIUSE, // single allocation shared for activations, activation gradients, and scratch
     DEFAULT, COUNT=DEFAULT, NUM_TYPES_PARAM=PARAMETER_MASTER+1
 };
@@ -169,6 +169,7 @@ struct TensorSpec {
     size_t num_elements; // per shard
     short num_shards;
     short remaining_layers;
+    short layer; // -1 for single layer tensors
 
     template <typename T>
     __host__ __device__ operator T*() const {
@@ -278,6 +279,7 @@ int add_tensor_spec(const char* name, size_t total_elements, size_t num_shards, 
     spec->num_elements = total_elements / num_shards;
     spec->num_shards = num_shards;
     spec->remaining_layers = 0;
+    spec->layer = -1;
 
     if (copy_offset_from >= 0) {
         TensorSpec base_spec = tensor_specs[copy_offset_from];
@@ -315,6 +317,7 @@ int add_layer_specs(int num_layers, const char* name, size_t total_elements, siz
         }
         int spec = add_tensor_spec(num_layers > 1 ? layer_name : name, total_elements, num_shards, data_type, copy_offset_from, flags, tensor_type);
         tensor_specs[spec].remaining_layers = num_layers - (l + 1);
+        tensor_specs[spec].layer = num_layers > 1 ? l : -1;
     }
     return first_tensor_id;
 }

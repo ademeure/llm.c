@@ -1,5 +1,11 @@
-#define ENABLE_FP8 // todo - makefile option
+//#define ENABLE_FP8 // todo - makefile option
 bool write_as_floatX = true; // todo - make command line option (and test it properly)
+
+//#define ONLY_DUMP_TENSORS
+//#define DUMP_TENSORS
+#define DUMP_TENSORS_SINGLE_LAYER
+#define DUMP_TENSORS_FP32
+//#define DUMP_TENSORS_RAW
 
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
@@ -161,6 +167,96 @@ typedef struct {
     unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
 } GPT2;
 
+void dump_all_tensors_to_file(GPT2* model) {
+    /*
+    print_tensor_elements(model->params[TT::PARAMETER].fcw + 4);
+    print_tensor_elements(model->acts.ln2 + 4);
+    print_tensor_elements(model->params[TT::PARAMETER].fcb + 4);
+    print_tensor_elements(model->acts.fch + 4);
+    exit(0);
+    */
+
+    // Create directory if it doesn't exist
+    mkdir("tensor_dump", 0777);
+    mkdir("tensor_dump_fp32", 0777);
+
+    size_t alloc_size = 0;
+    char* cpu_alloc = NULL;
+    float* cpu_alloc_fp32 = NULL;
+    float* gpu_alloc_fp32 = NULL;
+    for (int tensor_id = 0; tensor_id < num_tensor_specs; tensor_id++) {
+        TensorSpec spec = tensor_specs[tensor_id];
+
+#ifdef DUMP_TENSORS_SINGLE_LAYER
+        if (spec.layer >= 0 && spec.layer != 4) continue;
+#endif
+
+        size_t tensor_size = spec.num_elements * sizeof_dtype(spec.data_type);
+        size_t tensor_size_fp32 = spec.num_elements * sizeof(float);
+        if (alloc_size < tensor_size_fp32) {
+            if (cpu_alloc) free(cpu_alloc);
+            if (cpu_alloc_fp32) free(cpu_alloc_fp32);
+            if (gpu_alloc_fp32) cudaFree(gpu_alloc_fp32);
+            alloc_size = tensor_size_fp32;
+            cpu_alloc = (char*)malloc(tensor_size_fp32);
+            cpu_alloc_fp32 = (float*)malloc(tensor_size_fp32);
+            cudaMalloc(&gpu_alloc_fp32, tensor_size_fp32);
+        }
+        cudaMemcpy(cpu_alloc, spec.ptr, tensor_size, cudaMemcpyDeviceToHost);
+
+        // Use name in spec to name file
+        // *AND* the tensor type *AND* whether it has the "GRADIENT" flag set
+        char filename[512];
+        char type_name[32];
+        switch (spec.tensor_type) {
+            case TT::PARAMETER: strcpy(type_name, "param"); break;
+            case TT::PARAMETER_GRAD: strcpy(type_name, "param_grad"); break;
+            case TT::PARAMETER_GRAD_ABS: strcpy(type_name, "param_grad_abs"); break;
+            case TT::PARAMETER_GRAD_SQUARED: strcpy(type_name, "param_grad_squared"); break;
+            case TT::PARAMETER_OPT_M: strcpy(type_name, "opt_m"); break;
+            case TT::PARAMETER_OPT_V: strcpy(type_name, "opt_v"); break;
+            case TT::PARAMETER_MASTER: strcpy(type_name, "master"); break;
+            case TT::MULTIUSE: strcpy(type_name, spec.tensor_flags & TFlags::GRADIENT ? "act_grad" : "act"); break;
+        }
+
+#ifdef DUMP_TENSORS_RAW
+        switch (spec.data_type) {
+            case DType::FP32: sprintf(filename, "tensor_dump/%s_%s_fp32.bin", spec.name, type_name); break;
+            case DType::FP16: sprintf(filename, "tensor_dump/%s_%s_fp16.bin", spec.name, type_name); break;
+            case DType::BF16: sprintf(filename, "tensor_dump/%s_%s_bf16.bin", spec.name, type_name); break;
+            case DType::FP8E4M3: sprintf(filename, "tensor_dump/%s_%s_fp8e4m3.bin", spec.name, type_name); break;
+            case DType::FP8E5M2: sprintf(filename, "tensor_dump/%s_%s_fp8e5m2.bin", spec.name, type_name); break;
+        }
+
+        FILE* fp = fopen(filename, "wb");
+        fwrite(cpu_alloc, 1, tensor_size, fp);
+        fclose(fp);
+#endif
+#ifdef DUMP_TENSORS_FP32
+        // Convert to FP32
+        TensorSpec fake_float_spec = spec;
+        fake_float_spec.data_type = DType::FP32;
+        fake_float_spec.ptr = (char*)gpu_alloc_fp32;
+        TensorGPU<float> tensor_gpu_fp32 = fake_float_spec;
+
+        switch (spec.data_type) {
+            case DType::FP32: copy_advanced(tensor_gpu_fp32, (TensorGPU<float>)tensor_specs[tensor_id]); break;
+            case DType::FP16: copy_advanced(tensor_gpu_fp32, (TensorGPU<__nv_half>)tensor_specs[tensor_id]); break;
+            case DType::BF16: copy_advanced(tensor_gpu_fp32, (TensorGPU<__nv_bfloat16>)tensor_specs[tensor_id]); break;
+            case DType::FP8E4M3: copy_advanced(tensor_gpu_fp32, (TensorGPU<__nv_fp8_e4m3>)tensor_specs[tensor_id]); break;
+            case DType::FP8E5M2: copy_advanced(tensor_gpu_fp32, (TensorGPU<__nv_fp8_e5m2>)tensor_specs[tensor_id]); break;
+        }
+
+        cudaMemcpy(cpu_alloc_fp32, tensor_gpu_fp32, tensor_size_fp32, cudaMemcpyDeviceToHost);
+
+        sprintf(filename, "tensor_dump_fp32/%s_%s_fp32.bin", spec.name, type_name);
+        FILE* fp_fp32 = fopen(filename, "wb");
+        fwrite(cpu_alloc_fp32, 1, tensor_size_fp32, fp_fp32);
+        fclose(fp_fp32);
+    }
+#endif
+}
+
 #define TENSOR_SPECS(name, layers, dim, flags) spec->name = add_layer_specs(layers, #name, dim, shards, dtype, -1, flags, reuse_every_n)
 #define TENSOR_SPECS_LOWP(name, layers, dim, flags) spec->name = add_layer_specs(layers, #name, dim, shards, dtype_lowp, -1, flags, reuse_every_n)
 #define TENSOR_SPECS_FP32(name, layers, dim, flags) spec->name = add_layer_specs(layers, #name, dim, shards, DType::FP32, -1, flags, reuse_every_n)
@@ -182,13 +278,13 @@ void gpt2_allocate(GPT2 *model) {
     // 3) 4CC FP8 (largest parameter tensor, 2*C*C if floatX=BF16)
     // 4) B*T*T*NH (non-cuDNN attention tensor)
     size_t output_size = max(B*T * max(Vp, 4*C), 4*C*C/sizeof(floatX));
-    output_size = CUDNN_ENABLED ? output_size : max(output_size, B*T*T*NH);
+    output_size = (CUDNN_ENABLED ? output_size : max(output_size, B*T*T*NH)) * 2;
     // local scratch (floatX), must be big enough for:
     // 1) BTC (in floatX)
     // 2) 4BTC FP8 (transpose cache)
     // 2) 4CC FP8 (largest parameter tensor in FP8)
     // 3) 4BTC BF16 (non-cuDNN backwards scratch in floatX)
-    size_t local_scratch_size = max(CUDNN_ENABLED ? 4*BTC/sizeof(floatX) : 4*BTC, 4*C*C/sizeof(floatX));
+    size_t local_scratch_size = max(CUDNN_ENABLED ? 4*BTC/sizeof(floatX) : 4*BTC, 4*C*C/sizeof(floatX)) * 2;
 
     int reuse_every_n = 0;
     int shards = 1;
@@ -201,10 +297,10 @@ void gpt2_allocate(GPT2 *model) {
 
         current_tensor_type = (TT)t;
         ParameterTensors* spec = &model->params[t];
-        shards = (t == PARAMETER) ? 1 : (t == PARAMETER_GRAD) ? shards_grad : shards_opt;
+        shards = (t == PARAMETER) ? 1 : (t == PARAMETER_GRAD || t == PARAMETER_GRAD_ABS || t == PARAMETER_GRAD_SQUARED) ? shards_grad : shards_opt;
 
-        DType dtype = (t <= PARAMETER_GRAD) ? DTYPE_FLOATX : DType::FP32;
-        DType dtype_lowp = (t == PARAMETER) ? DTYPE_FP8E4 : ((t == PARAMETER_GRAD) ? DTYPE_FLOATX : DType::FP32);
+        DType dtype = (t <= PARAMETER_GRAD_SQUARED) ? DTYPE_FLOATX : DType::FP32;
+        DType dtype_lowp = (t == PARAMETER) ? DTYPE_FP8E4 : ((t == PARAMETER_GRAD || t == PARAMETER_GRAD_ABS || t == PARAMETER_GRAD_SQUARED) ? DTYPE_FLOATX : DType::FP32);
 
         TENSOR_SPECS     (wte,        1, Vp * C,    TENSOR_2D | EMBEDDING);
         TENSOR_SPECS     (wpe,        1, maxT * C,  TENSOR_2D | EMBEDDING);
@@ -367,6 +463,8 @@ void gpt2_allocate(GPT2 *model) {
     // todo - move this elsewhere so it's not in the middle of the parameter table...
     printf("number of parameter bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER] / (1024*1024));
     printf("number of parameter gradient bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER_GRAD] / (1024*1024));
+    printf("number of parameter gradient abs bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER_GRAD_ABS] / (1024*1024));
+    printf("number of parameter gradient squared bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER_GRAD_SQUARED] / (1024*1024));
     printf("number of m bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER_OPT_M] / (1024*1024));
     printf("number of v bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER_OPT_V] / (1024*1024));
     printf("number of master weight bytes: %zu MiB\n", tensors_bytes[TT::PARAMETER_MASTER] / (1024*1024));
@@ -667,6 +765,8 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
 
     gpt2_allocate(model);
 
+    printf("Starting to initialize parameters\n");
+
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
     // NOTE: assuming all parameters are of the type floatX, could be relaxed later
@@ -721,6 +821,8 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     } else {
         cudaCheck(cudaMemcpy(model->tensor_memory[PARAMETER], params_memory_cpu, model->num_parameters_bytes, cudaMemcpyHostToDevice));
     }
+
+    printf("Finished initializing parameters\n");
 
     free(params_memory_cpu);
 }
@@ -834,6 +936,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // 2) the gradients accumulate += into grads_memory, reset here
         cudaCheck(cudaMemsetAsync(ACT(losses), 0, B * T * sizeof(float), main_stream));
         cudaCheck(cudaMemsetAsync(model->tensor_memory[PARAMETER_GRAD], 0, tensors_bytes[PARAMETER_GRAD], main_stream));
+        cudaCheck(cudaMemsetAsync(model->tensor_memory[PARAMETER_GRAD_ABS], 0, tensors_bytes[PARAMETER_GRAD_ABS], main_stream));
+        cudaCheck(cudaMemsetAsync(model->tensor_memory[PARAMETER_GRAD_SQUARED], 0, tensors_bytes[PARAMETER_GRAD_SQUARED], main_stream));
     }
 
     // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
@@ -855,7 +959,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(AGRAD(lnf), PGRAD(wte), null_tensorX, AGRAD(output), ACT(lnf), PARAM(wte), scratchF, B*T, C, Vp);
+    matmul_backward(AGRAD(lnf), PGRAD(wte), null_tensorX, AGRAD(output), ACT(lnf), PARAM(wte), scratchF, scratchF_HUGE, B*T, C, Vp);
     // backward the final layernorm
     layernorm_backward(AGRAD_L(residual3, L-1), null_tensorX, PGRAD(lnfw), PGRAD(lnfb), scratchF, (tensorX)AGRAD(lnf), ACT_L(residual3, L-1),
                                PARAM(lnfw), ACT(lnf_mean), ACT(lnf_rstd), B*T, C);
@@ -878,7 +982,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         layernorm_backward(AGRAD(residual2), AGRAD(residual3), PGRAD(ln2w), PGRAD(ln2b), scratchF, (tensor8e5)AGRAD(ln2), ACT(residual2), PARAM(ln2w), ACT(ln2_mean), ACT(ln2_rstd), B*T, C);
 
         // AGRAD(atty) is BF16, AGRAD(residual2) is BF16, ACT(atty) is BF16, PARAM(attprojw) is BF16... ==> 100% BF16 ==> keep BF16 for now!
-        matmul_backward(AGRAD(atty), PGRAD(attprojw), PGRAD(attprojb), AGRAD(residual2), ACT(atty), PARAM(attprojw), scratchF, B*T, C, C);
+        matmul_backward(AGRAD(atty), PGRAD(attprojw), PGRAD(attprojb), AGRAD(residual2), ACT(atty), PARAM(attprojw), scratchF, scratchF_HUGE, B*T, C, C);
         #ifdef ENABLE_CUDNN
         attention_backward_cudnn(AGRAD(qkvr), AGRAD(atty), ACT(qkvr), ACT(atty), ACT(att), B, T, NH, C, main_stream);
         #else
@@ -1002,6 +1106,13 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         fprintf(stderr, "Need to allocate optimizer state before update");
         exit(EXIT_FAILURE);
     }
+
+#ifdef DUMP_TENSORS
+    dump_all_tensors_to_file(model);
+#ifdef ONLY_DUMP_TENSORS
+    exit(0);
+#endif
+#endif
 
     // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
     model->rng_state_last_update = model->rng_state;
@@ -1288,7 +1399,6 @@ void delete_checkpoint(const char* output_log_dir, int step, MultiGpuConfig* mul
 
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
-
 // ----------------------------------------------------------------------------
 // training resumption logic, very useful when jobs crash once in a while
 // the goal is that we can resume optimization from any checkpoint, bit-perfect
@@ -1347,6 +1457,7 @@ void error_usage() {
     fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
     fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
     fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
+    fprintf(stderr, "  -rs <int>    force rng state (default = 0, >0 to force)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1385,6 +1496,7 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    int force_rng_state = 0; // force rng state if >0
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1421,7 +1533,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r' && argv[i][2] == '\0') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
@@ -1434,6 +1546,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r' && argv[i][2] == 's') { force_rng_state = atoi(argv[i+1]); }
         else { error_usage(); }
     }
 
@@ -1512,6 +1625,10 @@ int main(int argc, char *argv[]) {
     model.recompute = recompute;
     model.batch_size = B;
     model.seq_len = T;
+    if (force_rng_state > 0) {
+        // Force the rng state if the flag is set
+        model.rng_state = force_rng_state; // Example value, replace with the desired rng state
+    }
 
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint

@@ -123,6 +123,11 @@ void matmul_cublaslt(tensorX d, const tensorX a, const tensorX b, const tensorX 
         exit(EXIT_FAILURE);
     }
 
+    //matmul_cublaslt(out=C, weight=A, inp=B, bias, m=OC=3072, n=BT=4096, k=C=768, stream, true=TransA, false=NoTransB, 0, 0, 0, 0, false, pre_gelu, false);
+    // ==> ALayout: 768 x 3072, +1 is in the 768-wide dim
+    // ==> BLayout: 768 x 4096, +1 is in the 4096-wide dim
+    // ==> CLayout: 3072 x 4096, +1 is in the 3072-wide dim
+
     // create the operation descriptor
     cublasLtMatmulDesc_t operationDesc;
     cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute, CUDA_R_32F));
@@ -383,7 +388,7 @@ void matmul_backward_fp8(tensor8e5 dinp, tensorX dweight, tensorX dbias,
                      tensor8 pre_gelu_activation=tensor8(), cudaStream_t stream=main_stream) {
 #ifndef ENABLE_FP8
     // FP8 is not enabled so we use the regular floatX matmul path
-    matmul_backward(dinp, dweight, dbias, dout, inp, weight, scratch1_big, BT, C, OC, pre_gelu_activation, 1, stream);
+    matmul_backward(dinp, dweight, dbias, dout, inp, weight, scratch1_big, scratch2_huge, BT, C, OC, pre_gelu_activation, 1, stream);
 #else
     NVTX_RANGE_FN();
     matmul_backward_bias(dbias, dout, scratch1_big, BT, OC, stream);
@@ -427,13 +432,63 @@ void matmul_backward_fp8(tensor8e5 dinp, tensorX dweight, tensorX dbias,
 #endif
 }
 
+template<typename Tout=float8, typename Tinp=float8>
+__global__ void write_abs_kernel(TensorGPU<Tout> out, TensorGPU<Tinp> inp) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * inp.num_per_128();
+    if (idx >= inp.num_elements) return;
+
+    auto out128 = new_tensor128(out);
+    auto inp128 = load_tensor128(inp, idx, true);
+    for(int k = 0; k < inp.num_per_128(); ++k) {
+        float xi = inp128.get(k);
+        out128.set(k, fabsf(xi));
+    }
+    out128.store(idx, false);
+}
+
+template<typename Tout=float8, typename Tinp=float8>
+__global__ void write_squared_kernel(TensorGPU<Tout> out, TensorGPU<Tinp> inp) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * inp.num_per_128();
+    if (idx >= inp.num_elements) return;
+
+    auto out128 = new_tensor128(out);
+    auto inp128 = load_tensor128(inp, idx, true);
+    for(int k = 0; k < inp.num_per_128(); ++k) {
+        float xi = inp128.get(k);
+        out128.set(k, xi * xi);
+    }
+    out128.store(idx, false);
+}
+
+template<typename Tout=float8, typename Tinp=float8>
+void write_abs(TensorGPU<Tout> out, TensorGPU<Tinp> inp, cudaStream_t stream=main_stream) {
+    write_abs_kernel<<<CEIL_DIV(inp.num_elements, 128), 128, 0, stream>>>(out, inp);
+    cudaCheck(cudaGetLastError());
+}
+
+template<typename Tout=float8, typename Tinp=float8>
+void write_squared(TensorGPU<Tout> out, TensorGPU<Tinp> inp, cudaStream_t stream=main_stream) {
+    write_squared_kernel<<<CEIL_DIV(inp.num_elements, 128), 128, 0, stream>>>(out, inp);
+    cudaCheck(cudaGetLastError());
+}
 
 void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
                      tensorX dout, tensorX inp, tensorX weight,
-                     tensor32 dbias_scratch,
+                     tensor32 dbias_scratch, tensor32 scratch2_huge,
                      int BT, int C, int OC,
                      tensorX pre_gelu_activation=null_tensorX, int gelu_fusion=1, cudaStream_t stream=main_stream) {
     NVTX_RANGE_FN();
+    TensorSpec dweight_abs_spec = tensor_specs[dweight.id + tensors_start[TT::PARAMETER_GRAD_ABS] - tensors_start[TT::PARAMETER_GRAD]];
+    TensorSpec dweight_squared_spec = tensor_specs[dweight.id + tensors_start[TT::PARAMETER_GRAD_SQUARED] - tensors_start[TT::PARAMETER_GRAD]];
+    tensorX dweight_abs = tensor_specs[dweight_abs_spec.id];
+    tensorX dweight_squared = tensor_specs[dweight_squared_spec.id];
+
+    /*
+    printf("dweight_spec: %s, id: %d\n", dweight_spec.name, dweight.id);
+    printf("dweight_abs_spec: %s, id: %d\n", dweight_abs_spec.name, dweight_abs_spec.id);
+    printf("dweight_squared_spec: %s, id: %d\n", dweight_squared_spec.name, dweight_squared_spec.id);
+    */
+
     matmul_backward_bias(dbias, dout, dbias_scratch, BT, OC, stream);
 
     // backward to input, uses = in the backward pass (set the gradient)
@@ -447,5 +502,22 @@ void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
     matmul_cublaslt(dweight, inp, dout, null_tensorX /*dbias*/, C, OC, BT, stream, false, true, 0, 0, 0, 0,
-                    true /* accumulate */, null_tensorX, true);
+                    false /* accumulate */, null_tensorX, true);
+
+
+    tensorX inp_mod = inp;
+    tensorX dout_mod = dout;
+    inp_mod.data_ptr = (floatX*)dbias_scratch.data_ptr;
+    dout_mod.data_ptr = (floatX*)(scratch2_huge.data_ptr);
+
+    write_abs(inp_mod, inp, stream);
+    write_abs(dout_mod, dout, stream);
+    matmul_cublaslt(dweight_abs, inp_mod, dout_mod, null_tensorX, C, OC, BT, stream, false, true, 0, 0, 0, 0,
+                    false, null_tensorX, true);
+
+    write_squared(inp_mod, inp, stream);
+    write_squared(dout_mod, dout, stream);
+    matmul_cublaslt(dweight_squared, inp_mod, dout_mod, null_tensorX, C, OC, BT, stream, false, true, 0, 0, 0, 0,
+                    false, null_tensorX, true);
+
 }
