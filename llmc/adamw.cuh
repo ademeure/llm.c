@@ -14,13 +14,13 @@ __device__ float lerp(float start, float end, float weight) {
 }
 
 
-
+#if 1
 
 
 #ifdef ENABLE_FP8
 constexpr size_t opt_iteration_size = 16; // todo - this causes sparsit and bank clashes for FP32/BF16 loads/stores
 #else
-constexpr size_t opt_iteration_size = 8; // todo - this causes sparsit and bank clashes for FP32 loads/stores
+constexpr size_t opt_iteration_size = 16; // todo - this causes sparsit and bank clashes for FP32 loads/stores
 #endif
 
 template <bool use_master_weights=true, typename Tparam=floatX, typename Tgrad=floatX, typename Tm=float, typename Tv=float, typename Tmaster=float>
@@ -77,6 +77,8 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor,
 
                 float param;
                 if (true) {
+                    grad *= grad_scale;
+
                     // AdamW for non-matmul stuff for now
                     m = lerp(grad, m, beta1);
                     v = lerp(grad * grad, v, beta2);
@@ -86,11 +88,21 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor,
                     v /= beta2_correction;
 
                     float lr = learning_rate;
+                    if (signbit(m) != signbit(grad)) {
+                        //lr *= 0.2f;
+                    }
+
                     if (grad_abs != 0.0f) {
-                        lr *= min(1.0f, powf(fabsf(grad) / grad_abs, 0.1f));
-                        //if (signbit(m) != signbit(grad)) {
-                        //    lr *= 0.1f;
-                        //}
+                        float mean_sign = grad_abs / (1024.0f * 64.0f);
+                        lr *= powf(fabsf(mean_sign), 0.125f);
+                        lr *= 2.0f;
+
+                        if (idx % 3376 == 0 && k == 0) {
+                            //printf("%s[%u] ==> percentage: %.16f\n", tensor_specs_ptr[param_tensor.id].name, offset, percentage);
+                        }
+
+                        //lr *= min(1.0f, powf(fabsf(grad) / grad_abs, 0.1f));
+                        //lr *= 1.1f;
                         //lr *= 1.5f;
 
                         //lr *= min(10.0f, powf(grad_abs / fabsf(grad), 0.75f));
@@ -232,12 +244,11 @@ __global__ void adamw_update_everything(int num_params_tensors, int start_tensor
 
 
 
+#else
 
 
 
 
-
-/*
 
 template <bool use_master_weights=true, typename Tparam=floatX, typename Tgrad=floatX, typename Tm=float, typename Tv=float, typename Tmaster=float>
 __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor,
@@ -281,6 +292,8 @@ __device__ size_t adamw_update_part(TensorGPU<Tparam> param_tensor,
                 float grad = grad128.get(current_idx[PARAMETER_GRAD] + k);
                 float m = opt_m128.get(current_idx[PARAMETER_OPT_M] + k);
                 float v = opt_v128.get(current_idx[PARAMETER_OPT_V] + k);
+
+                grad *= grad_scale;
 
                 m = lerp(grad, m, beta1);
                 v = lerp(grad * grad, v, beta2);
@@ -387,4 +400,5 @@ __global__ void adamw_update_everything(int num_params_tensors, int start_tensor
         }
     }
 }
-*/
+
+#endif

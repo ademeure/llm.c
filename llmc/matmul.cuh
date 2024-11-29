@@ -441,7 +441,8 @@ __global__ void write_abs_kernel(TensorGPU<Tout> out, TensorGPU<Tinp> inp) {
     auto inp128 = load_tensor128(inp, idx, true);
     for(int k = 0; k < inp.num_per_128(); ++k) {
         float xi = inp128.get(k);
-        out128.set(k, fabsf(xi));
+        float out = (xi < 0.0f) ? -1.0f : (xi > 0.0f) ? 1.0f : 0.0f;
+        out128.set(k, out);
     }
     out128.store(idx, false);
 }
@@ -462,13 +463,13 @@ __global__ void write_squared_kernel(TensorGPU<Tout> out, TensorGPU<Tinp> inp) {
 
 template<typename Tout=float8, typename Tinp=float8>
 void write_abs(TensorGPU<Tout> out, TensorGPU<Tinp> inp, cudaStream_t stream=main_stream) {
-    write_abs_kernel<<<CEIL_DIV(inp.num_elements, 128), 128, 0, stream>>>(out, inp);
+    write_abs_kernel<<<CEIL_DIV(inp.num_elements, 128 * inp.num_per_128()), 128, 0, stream>>>(out, inp);
     cudaCheck(cudaGetLastError());
 }
 
 template<typename Tout=float8, typename Tinp=float8>
 void write_squared(TensorGPU<Tout> out, TensorGPU<Tinp> inp, cudaStream_t stream=main_stream) {
-    write_squared_kernel<<<CEIL_DIV(inp.num_elements, 128), 128, 0, stream>>>(out, inp);
+    write_squared_kernel<<<CEIL_DIV(inp.num_elements, 128 * inp.num_per_128()), 128, 0, stream>>>(out, inp);
     cudaCheck(cudaGetLastError());
 }
 
@@ -502,7 +503,7 @@ void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
 
     // backward to weight, uses += in the backward pass (accumulate the gradient) by setting alpha=one
     matmul_cublaslt(dweight, inp, dout, null_tensorX /*dbias*/, C, OC, BT, stream, false, true, 0, 0, 0, 0,
-                    false /* accumulate */, null_tensorX, true);
+                    true /* accumulate */, null_tensorX, true);
 
 
     tensorX inp_mod = inp;
@@ -513,11 +514,12 @@ void matmul_backward(tensorX dinp, tensorX dweight, tensorX dbias,
     write_abs(inp_mod, inp, stream);
     write_abs(dout_mod, dout, stream);
     matmul_cublaslt(dweight_abs, inp_mod, dout_mod, null_tensorX, C, OC, BT, stream, false, true, 0, 0, 0, 0,
-                    false, null_tensorX, true);
+                    true, null_tensorX, true);
 
+/*
     write_squared(inp_mod, inp, stream);
     write_squared(dout_mod, dout, stream);
     matmul_cublaslt(dweight_squared, inp_mod, dout_mod, null_tensorX, C, OC, BT, stream, false, true, 0, 0, 0, 0,
                     false, null_tensorX, true);
-
+*/
 }

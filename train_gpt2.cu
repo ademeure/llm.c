@@ -997,7 +997,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
-            floatX* const pointers[] = {
+            floatX* pointers[] = {
                 PGRAD(ln1w), PGRAD(ln1b),
                 PGRAD(qkvw), PGRAD(qkvb),
                 PGRAD(attprojw), PGRAD(attprojb),
@@ -1013,6 +1013,11 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 4 * C * C, 4 * C,
                 C * 4 * C, C
             };
+            multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+            ptrdiff_t offset_abs = model->tensor_memory[PARAMETER_GRAD_ABS] - model->tensor_memory[PARAMETER_GRAD];
+            for (int i = 0; i < sizeof(pointers) / sizeof(pointers[0]); i++) {
+                pointers[i] += offset_abs / sizeof(floatX);
+            }
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
 
@@ -1059,8 +1064,16 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         #endif
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         // reduce the gradients for non-transformer block parameters
-        floatX* const pointers[] = {PGRAD(wte), PGRAD(wpe), PGRAD(lnfw), PGRAD(lnfb)};
+        floatX* pointers[] = {PGRAD(wte), PGRAD(wpe), PGRAD(lnfw), PGRAD(lnfb)};
         const size_t nelem[] = {Vp * C, T * C, C, C};
+        multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        ptrdiff_t offset_abs = model->tensor_memory[PARAMETER_GRAD_ABS] - model->tensor_memory[PARAMETER_GRAD];
+        //printf("offset_abs: %td\n", offset_abs);
+        //printf("tensor_memory[PARAMETER_GRAD_ABS]: %p\n", model->tensor_memory[PARAMETER_GRAD_ABS]);
+        //printf("tensor_memory[PARAMETER_GRAD]: %p\n", model->tensor_memory[PARAMETER_GRAD]);
+        for (int i = 0; i < sizeof(pointers) / sizeof(pointers[0]); i++) {
+            pointers[i] += offset_abs / sizeof(floatX);
+        }
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
     }
 
@@ -1911,10 +1924,12 @@ int main(int argc, char *argv[]) {
 
             // todo - hack - because the 1st step is now kinda useless due to FP8 absmax scaling not being ready
             // todo - ideally should rerun this step so we don't "waste" the data without training on it
+            /*
             if (step == 0) {
                 step_learning_rate = 0.0f;
                 weight_decay = 0.0f;
             }
+            */
 
             gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
         }
